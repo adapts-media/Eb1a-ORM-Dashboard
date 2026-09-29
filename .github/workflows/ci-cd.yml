@@ -61,15 +61,21 @@ jobs:
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          # printf, not echo: the key file must end in a newline or ssh rejects it.
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          # Fail here with a clear message rather than deep inside ssh.
+          if ! ssh-keygen -y -f ~/.ssh/id_ed25519 > /tmp/pub.txt 2>/tmp/keyerr.txt; then
+            echo 'DEPLOY_SSH_KEY is not a valid private key:'
+            cat /tmp/keyerr.txt
+            exit 1
+          fi
+          echo "key fingerprint: $(ssh-keygen -lf /tmp/pub.txt | awk '{print $2}')"
 
       - name: Deploy
         run: |
-          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes \
-            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-            'bash /opt/orm-dashboard/redeploy.sh'
+          set -x
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'bash /opt/orm-dashboard/redeploy.sh'
 
       - name: Health check
         run: |

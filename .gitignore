@@ -18,3 +18,7 @@ backups/
 # editor/OS
 .DS_Store
 Thumbs.db
+
+# python bytecode
+__pycache__/
+*.pyc
