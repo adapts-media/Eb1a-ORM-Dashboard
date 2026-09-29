@@ -1,0 +1,78 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Never let two deploys touch the server at once; a superseded run is cancelled.
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Typecheck & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install backend deps
+        working-directory: backend
+        # --ignore-scripts: postinstall pip-installs Playwright, which the runner
+        # doesn't need just to typecheck.
+        run: npm install --ignore-scripts --include=dev
+
+      - name: Generate Prisma client
+        working-directory: backend
+        run: npx prisma generate --schema=prisma/schema.prisma
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm install --include=dev
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Check Python scrapers compile
+        run: python -m compileall -q backend/scripts
+
+  deploy:
+    name: Deploy to production
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            'bash /opt/orm-dashboard/redeploy.sh'
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://orm.adaptsmedia.info/api/health || true)
+            if [ "$code" = "200" ]; then echo "healthy"; exit 0; fi
+            echo "attempt $i: HTTP $code"; sleep 10
+          done
+          echo "health check failed"; exit 1
