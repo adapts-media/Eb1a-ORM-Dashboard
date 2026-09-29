@@ -23,6 +23,10 @@ jobs:
         with:
           node-version: '22'
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install backend deps
         working-directory: backend
         # --ignore-scripts: postinstall pip-installs Playwright, which the runner
@@ -46,14 +50,13 @@ jobs:
         run: npm run build
 
       - name: Check Python scrapers compile
-        run: python -m compileall -q backend/scripts
+        run: python3 -m compileall -q backend/scripts
 
   deploy:
     name: Deploy to production
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    environment: production
     steps:
       - name: Set up SSH
         run: |
