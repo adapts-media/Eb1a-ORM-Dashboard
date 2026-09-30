@@ -12,7 +12,7 @@ export async function runManualScrapePipeline(term: string, platformStr: string,
   const dbKeyword = await prisma.keyword.upsert({
     where: { term },
     create: { term },
-    update: {},
+    update: { deletedAt: null, purgeAt: null },
   });
 
   const scrapeRun = await prisma.scrapeRun.create({

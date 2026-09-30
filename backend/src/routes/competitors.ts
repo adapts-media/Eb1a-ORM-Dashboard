@@ -5,23 +5,31 @@ import { normalizeApifyItems } from "../services/dataNormalizer";
 import { buildSourceKey } from "../lib/hash";
 import { ProcessingStatus } from "../types/status";
 import { analyzePost, analyzeComment } from "../services/pipelineService";
+import { computePurgeAt, logDeletion, logRestore } from "../services/queryService";
 
 export const competitorsRouter = Router();
 
-// Stores scraped competitor items and runs Mistral sentiment on them, same as brand
-// mentions. Competitor items are still excluded from negative-mention email alerts —
-// those exist to flag your own reputation, not a rival's.
+// Stores scraped competitor items. AI sentiment analysis is opt-in per
+// competitor card (CompetitorCard.sentimentEnabled) — feature: "turn on
+// sentiment scoring for competitors". When disabled (the default), items
+// are stamped with a placeholder verdict — status ANALYZED, sentiment
+// NEUTRAL, confidence 1.0 — the exact same stamp `reset_competitor_sentiment.ts`
+// knows how to clear, so a card can be switched on later and its backlog
+// picked up for real analysis. Competitor items are still excluded from
+// negative-mention email alerts — those exist to flag your own reputation,
+// not a rival's.
 export async function runCompetitorScrapePipeline(
   term: string,
   platformName: string,
-  rawPayload: any[]
+  rawPayload: any[],
+  sentimentEnabled = false
 ) {
   const normalized = normalizeApifyItems(rawPayload);
 
   const dbKeyword = await prisma.keyword.upsert({
     where: { term },
     create: { term },
-    update: {},
+    update: { deletedAt: null, purgeAt: null },
   });
 
   const scrapeRun = await prisma.scrapeRun.create({
@@ -42,6 +50,20 @@ export async function runCompetitorScrapePipeline(
   const createdCommentIds: string[] = [];
   // Scraper-side comment id -> stored DB id, for reply threading.
   const commentIdMap = new Map<string, string>();
+
+  // When sentiment is off: stamp the placeholder verdict at creation time so
+  // the item never enters RECEIVED status and can never be picked up by the
+  // hourly backlog sweep (pipelineService.ts's analyzeBacklog) — gating only
+  // the analyze calls below would not be enough, since that sweep has no
+  // per-card awareness and would silently re-analyze it anyway.
+  const neutralPlaceholder = {
+    status: ProcessingStatus.ANALYZED,
+    sentiment: "NEUTRAL" as const,
+    confidence: 1.0,
+    analyzedAt: new Date(),
+  };
+  const pendingAnalysis = { status: ProcessingStatus.RECEIVED };
+  const itemStamp = sentimentEnabled ? pendingAnalysis : neutralPlaceholder;
 
   for (const post of normalized.posts) {
     const sourceKey = buildSourceKey({
@@ -90,13 +112,13 @@ export async function runCompetitorScrapePipeline(
           shares: post.shares ?? null,
           commentsCount: post.commentsCount ?? null,
           rawItem: JSON.stringify(post.raw || {}),
-          status: ProcessingStatus.RECEIVED,
           isCompetitor: true,
+          ...itemStamp,
         },
       });
       postsCreated++;
       currentPostId = created.id;
-      createdPostIds.push(created.id);
+      if (sentimentEnabled) createdPostIds.push(created.id);
     }
 
     // Process nested comments for this post
@@ -145,12 +167,12 @@ export async function runCompetitorScrapePipeline(
               publishedAt: c.publishedAt ? new Date(c.publishedAt) : null,
               likes: c.likes ?? null,
               rawItem: JSON.stringify(c.raw || {}),
-              status: ProcessingStatus.RECEIVED,
               isCompetitor: true,
+              ...itemStamp,
             },
           });
           commentsCreated++;
-          createdCommentIds.push(createdComment.id);
+          if (sentimentEnabled) createdCommentIds.push(createdComment.id);
           if (c.id) commentIdMap.set(c.id, createdComment.id);
         }
       }
@@ -197,20 +219,24 @@ export async function runCompetitorScrapePipeline(
           publishedAt: c.publishedAt ? new Date(c.publishedAt) : null,
           likes: c.likes ?? null,
           rawItem: JSON.stringify(c.raw || {}),
-          status: ProcessingStatus.RECEIVED,
           isCompetitor: true,
+          ...itemStamp,
         },
       });
       commentsCreated++;
-      createdCommentIds.push(createdStandalone.id);
+      if (sentimentEnabled) createdCommentIds.push(createdStandalone.id);
     }
   }
 
-  // Run Mistral sentiment on the newly stored competitor items.
+  // Run Mistral sentiment on the newly stored competitor items — only when
+  // this card has opted in. Relevance is checked against the competitor's
+  // own name (`term`), not the brand's.
   let analyzed = 0;
   let failed = 0;
-  for (const id of createdPostIds) (await analyzePost(id)) ? analyzed++ : failed++;
-  for (const id of createdCommentIds) (await analyzeComment(id)) ? analyzed++ : failed++;
+  if (sentimentEnabled) {
+    for (const id of createdPostIds) (await analyzePost(id, term)) ? analyzed++ : failed++;
+    for (const id of createdCommentIds) (await analyzeComment(id, term)) ? analyzed++ : failed++;
+  }
 
   return {
     scrapeRunId: scrapeRun.id,
@@ -220,13 +246,15 @@ export async function runCompetitorScrapePipeline(
     commentsSkippedExisting,
     analyzed,
     failed,
+    sentimentEnabled,
   };
 }
 
-// GET /api/competitor-cards — list all competitor cards
+// GET /api/competitor-cards — list all (non-deleted) competitor cards
 competitorsRouter.get("/cards", async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const cards = await (prisma as any).competitorCard.findMany({
+      where: { deletedAt: null },
       orderBy: { createdAt: "desc" },
     });
     res.json({ cards });
@@ -247,6 +275,7 @@ competitorsRouter.post("/cards", async (req: Request, res: Response, next: NextF
     const cleanKeyword = keyword.trim();
     const cleanUrl = searchUrl && typeof searchUrl === "string" ? searchUrl.trim() : null;
 
+    // Upsert also revives a soft-deleted card with the same platform+keyword.
     const card = await (prisma as any).competitorCard.upsert({
       where: { platform_keyword: { platform: cleanPlatform, keyword: cleanKeyword } },
       create: {
@@ -258,6 +287,8 @@ competitorsRouter.post("/cards", async (req: Request, res: Response, next: NextF
       update: {
         searchUrl: cleanUrl,
         enabled: true,
+        deletedAt: null,
+        purgeAt: null,
       },
     });
 
@@ -269,13 +300,41 @@ competitorsRouter.post("/cards", async (req: Request, res: Response, next: NextF
   }
 });
 
-// DELETE /api/competitor-cards/:id
+// DELETE /api/competitor-cards/:id — soft-deletes with a 24h undo window
+// instead of an immediate hard delete.
 competitorsRouter.delete("/cards/:id", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
-    await (prisma as any).competitorCard.delete({ where: { id } });
+    const { actor } = req.body ?? {};
+
+    const card = await (prisma as any).competitorCard.findUnique({ where: { id } });
+    if (!card) return res.json({ ok: true, message: "Competitor card deleted." });
+
+    const purgeAt = computePurgeAt();
+    await (prisma as any).competitorCard.update({ where: { id }, data: { deletedAt: new Date(), purgeAt } });
+    await logDeletion("CompetitorCard", id, `${card.platform}: ${card.keyword}`, typeof actor === "string" ? actor : undefined);
     await syncCompetitorFlags();
-    res.json({ ok: true, message: "Competitor card deleted." });
+
+    res.json({ ok: true, message: "Competitor card moved to trash. It can be restored within 24 hours.", purgeAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/competitor-cards/:id/restore — undoes a delete within the grace window
+competitorsRouter.post("/cards/:id/restore", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const card = await (prisma as any).competitorCard.findUnique({ where: { id } });
+    if (!card || !card.deletedAt) {
+      return res.status(404).json({ error: "Competitor card not found in trash." });
+    }
+
+    const restored = await (prisma as any).competitorCard.update({ where: { id }, data: { deletedAt: null, purgeAt: null } });
+    await logRestore("CompetitorCard", id);
+    await syncCompetitorFlags();
+
+    res.json({ ok: true, card: restored, message: "Competitor card restored." });
   } catch (err) {
     next(err);
   }
@@ -299,7 +358,28 @@ competitorsRouter.patch("/cards/:id/toggle", async (req: Request, res: Response,
   }
 });
 
-// POST /api/competitor-cards/run-card/:id — execute scraping for single competitor card (no AI sentiment)
+// PATCH /api/competitor-cards/:id/toggle-sentiment — feature: "turn on
+// sentiment scoring for competitors". Opt-in per card, so enabling AI
+// analysis for one competitor never silently increases spend for the rest.
+competitorsRouter.patch("/cards/:id/toggle-sentiment", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const card = await (prisma as any).competitorCard.findUnique({ where: { id } });
+    if (!card) return res.status(404).json({ error: "Card not found." });
+
+    const updated = await (prisma as any).competitorCard.update({
+      where: { id },
+      data: { sentimentEnabled: !card.sentimentEnabled },
+    });
+
+    res.json({ ok: true, card: updated });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/competitor-cards/run-card/:id — execute scraping for a single competitor card.
+// AI sentiment only runs if this card has sentimentEnabled = true.
 competitorsRouter.post("/cards/run-card/:id", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
@@ -317,7 +397,7 @@ competitorsRouter.post("/cards/run-card/:id", async (req: Request, res: Response
       platform: platform as any,
     });
 
-    const result = await runCompetitorScrapePipeline(keyword, platform, rawItems);
+    const result = await runCompetitorScrapePipeline(keyword, platform, rawItems, Boolean(card.sentimentEnabled));
     await syncCompetitorFlags();
 
     await (prisma as any).competitorCard.update({
@@ -335,7 +415,7 @@ competitorsRouter.post("/cards/run-card/:id", async (req: Request, res: Response
 competitorsRouter.post("/cards/run-all", async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const activeCards = await (prisma as any).competitorCard.findMany({
-      where: { enabled: true },
+      where: { enabled: true, deletedAt: null },
     });
 
     if (activeCards.length === 0) {
@@ -351,7 +431,7 @@ competitorsRouter.post("/cards/run-all", async (_req: Request, res: Response, ne
           limit: 100,
           platform: card.platform as any,
         });
-        const res = await runCompetitorScrapePipeline(card.keyword, card.platform, rawItems);
+        const res = await runCompetitorScrapePipeline(card.keyword, card.platform, rawItems, Boolean(card.sentimentEnabled));
         totalNew += (res.postsCreated || 0) + (res.commentsCreated || 0);
         await (prisma as any).competitorCard.update({
           where: { id: card.id },
@@ -378,8 +458,8 @@ competitorsRouter.get("/items", async (req: Request, res: Response, next: NextFu
     const page = Number(req.query.page) || 1;
     const pageSize = Number(req.query.pageSize) || 20;
 
-    const wherePost: any = { isCompetitor: true };
-    const whereComment: any = { isCompetitor: true };
+    const wherePost: any = { isCompetitor: true, deletedAt: null };
+    const whereComment: any = { isCompetitor: true, deletedAt: null };
 
     if (platform && platform !== "all") {
       const platLower = platform.toLowerCase().trim();
@@ -491,10 +571,10 @@ competitorsRouter.get("/items", async (req: Request, res: Response, next: NextFu
 competitorsRouter.get("/overview", async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const [totalPosts, totalComments, activeCardsCount, cards] = await Promise.all([
-      prisma.post.count({ where: { isCompetitor: true } }),
-      prisma.comment.count({ where: { isCompetitor: true } }),
-      (prisma as any).competitorCard.count({ where: { enabled: true } }),
-      (prisma as any).competitorCard.findMany(),
+      prisma.post.count({ where: { isCompetitor: true, deletedAt: null } }),
+      prisma.comment.count({ where: { isCompetitor: true, deletedAt: null } }),
+      (prisma as any).competitorCard.count({ where: { enabled: true, deletedAt: null } }),
+      (prisma as any).competitorCard.findMany({ where: { deletedAt: null } }),
     ]);
 
     const totalMentions = totalPosts + totalComments;

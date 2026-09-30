@@ -63,8 +63,9 @@ export async function generateExcelReport(options: ExcelExportOptions = {}): Pro
   await syncCompetitorFlags().catch(() => {});
 
   const scope = options.scope ?? "all";
-  const pWhere: Prisma.PostWhereInput = {};
-  const cWhere: Prisma.CommentWhereInput = {};
+  // Exports should never include trashed items (deletion safety net).
+  const pWhere: Prisma.PostWhereInput = { deletedAt: null };
+  const cWhere: Prisma.CommentWhereInput = { deletedAt: null };
 
   if (scope === "brand") {
     pWhere.isCompetitor = false;

@@ -15,6 +15,8 @@ import {
   KeywordSentimentBars,
   PlatformSentimentBars,
 } from "../components/charts/Charts";
+import { UndoToast, type PendingDeletion } from "../components/UndoToast";
+import { getActorName } from "../lib/actor";
 
 export function OverviewPage() {
   const [selectedPlatform, setSelectedPlatform] = useState<string>("all");
@@ -28,6 +30,7 @@ export function OverviewPage() {
   const [keywords, setKeywords] = useState<KeywordSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [pendingUndo, setPendingUndo] = useState<PendingDeletion | null>(null);
 
   async function loadData(platform = selectedPlatform, dr = dateRange, source = selectedSource) {
     setLoading(true);
@@ -75,15 +78,27 @@ export function OverviewPage() {
     });
   }
 
+  // Feature: "add a safety net before deleting anything". The confirm()
+  // click below is step one; step two is the delete itself being a soft
+  // delete with a 24h undo window — this shows the Undo toast for that
+  // window and attributes the action in the DeletionLog audit trail.
   async function handleDeleteKeyword(term: string) {
     const kw = keywords.find((k) => k.term === term);
     if (!kw) return;
-    const confirmed = window.confirm(`Are you sure you want to delete keyword "${term}" and all its scraped items?`);
+    const confirmed = window.confirm(`Delete keyword "${term}" and all its scraped items? You can undo this for the next 24 hours.`);
     if (!confirmed) return;
 
     try {
-      await api.deleteKeyword(kw.id);
+      const actor = getActorName();
+      await api.deleteKeyword(kw.id, actor);
       await loadData(selectedPlatform, dateRange);
+      setPendingUndo({
+        label: `Keyword "${term}" deleted`,
+        undo: async () => {
+          await api.restoreKeyword(kw.id);
+          await loadData(selectedPlatform, dateRange);
+        },
+      });
     } catch (err: any) {
       setError(err.message || "Failed to delete keyword.");
     }
@@ -281,6 +296,8 @@ export function OverviewPage() {
           )}
         </>
       )}
+
+      <UndoToast pending={pendingUndo} onDismiss={() => setPendingUndo(null)} />
     </div>
   );
 }

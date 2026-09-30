@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { runScrapeForKeyword, PipelineError } from "../services/pipelineService";
-import { getKeywords } from "../services/queryService";
+import { getKeywords, computePurgeAt, logDeletion, logRestore } from "../services/queryService";
 import { ApifyError } from "../services/apifyService";
 import { ConfigError } from "../config/env";
 import { prisma } from "../lib/prisma";
@@ -39,16 +39,45 @@ keywordsRouter.post("/scrape", async (req, res) => {
   }
 });
 
-// DELETE /api/keywords/:id — delete a keyword and its associated items
+// DELETE /api/keywords/:id — soft-deletes a keyword AND all of its posts/
+// comments on the same grace window, instead of deleting anything
+// immediately. Restoring the keyword (below) brings its items back too.
 keywordsRouter.delete("/:id", async (req, res, next) => {
   try {
     const { id } = req.params;
-    await prisma.comment.deleteMany({ where: { keywordId: id } });
-    await prisma.post.deleteMany({ where: { keywordId: id } });
-    await prisma.scrapeRun.deleteMany({ where: { keywordId: id } });
-    await prisma.keyword.delete({ where: { id } });
+    const { actor } = req.body ?? {};
 
-    res.json({ ok: true, message: "Keyword deleted successfully." });
+    const keyword = await prisma.keyword.findUnique({ where: { id } });
+    if (!keyword) return res.status(404).json({ error: "Keyword not found." });
+
+    const now = new Date();
+    const purgeAt = computePurgeAt();
+    await prisma.comment.updateMany({ where: { keywordId: id, deletedAt: null }, data: { deletedAt: now, purgeAt } });
+    await prisma.post.updateMany({ where: { keywordId: id, deletedAt: null }, data: { deletedAt: now, purgeAt } });
+    await prisma.keyword.update({ where: { id }, data: { deletedAt: now, purgeAt } });
+    await logDeletion("Keyword", id, keyword.term, typeof actor === "string" ? actor : undefined);
+
+    res.json({ ok: true, message: "Keyword moved to trash. It can be restored within 24 hours.", purgeAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/keywords/:id/restore — undoes a delete within the grace window
+keywordsRouter.post("/:id/restore", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const keyword = await prisma.keyword.findUnique({ where: { id } });
+    if (!keyword || !keyword.deletedAt) {
+      return res.status(404).json({ error: "Keyword not found in trash (it may have already been purged or was never deleted)." });
+    }
+
+    await prisma.post.updateMany({ where: { keywordId: id, purgeAt: keyword.purgeAt ?? undefined }, data: { deletedAt: null, purgeAt: null } });
+    await prisma.comment.updateMany({ where: { keywordId: id, purgeAt: keyword.purgeAt ?? undefined }, data: { deletedAt: null, purgeAt: null } });
+    await prisma.keyword.update({ where: { id }, data: { deletedAt: null, purgeAt: null } });
+    await logRestore("Keyword", id);
+
+    res.json({ ok: true, message: "Keyword restored." });
   } catch (err) {
     next(err);
   }

@@ -3,9 +3,48 @@ import { ProcessingStatus } from "../types/status";
 import { buildSourceKey } from "../lib/hash";
 import { fetchApifyResults, ApifyError } from "./apifyService";
 import { normalizeApifyItems } from "./dataNormalizer";
-import { classifySentiment, AiSentimentError } from "./sentimentService";
+import { classifyMention, AiSentimentError } from "./sentimentService";
 import { sendNegativeMentionAlert } from "./emailService";
-import { NormalizedComment, NormalizedPost } from "../types/normalized";
+import { NormalizedComment, NormalizedPost, MentionContext, RelevanceMethod } from "../types/normalized";
+import { BRAND_GROUP_NAME, BRAND_NAME_VARIANTS } from "../config/brand";
+
+/** Human-readable, code-generated (not AI-generated, to save output tokens) explanation of a relevance verdict. */
+function describeRelevanceMethod(method: RelevanceMethod): string {
+  switch (method) {
+    case "keyword_match":
+      return "Text contains the brand/competitor name directly.";
+    case "ai_check":
+      return "AI judged relevance — name not literally present in the text.";
+    default:
+      return "Relevance not evaluated.";
+  }
+}
+
+/**
+ * Assembles brief context for a reply: the post it's under (title, falling
+ * back to the start of the post's text since Post.title is often left null
+ * — the title gets folded into `text` at ingest instead), and, if this is a
+ * reply to another comment, that immediate parent's text only (not the
+ * whole ancestor chain, to keep token cost bounded).
+ */
+async function buildReplyContext(comment: { postId: string | null; parentCommentId: string | null }): Promise<MentionContext | undefined> {
+  if (!comment.postId && !comment.parentCommentId) return undefined;
+
+  const [post, parent] = await Promise.all([
+    comment.postId
+      ? prisma.post.findUnique({ where: { id: comment.postId }, select: { title: true, text: true } })
+      : Promise.resolve(null),
+    comment.parentCommentId
+      ? prisma.comment.findUnique({ where: { id: comment.parentCommentId }, select: { text: true } })
+      : Promise.resolve(null),
+  ]);
+
+  const postTitle = post?.title || post?.text?.slice(0, 150) || undefined;
+  const parentText = parent?.text ?? undefined;
+  if (!postTitle && !parentText) return undefined;
+
+  return { postTitle, parentText };
+}
 
 export interface RunScrapeResult {
   keyword: string;
@@ -24,10 +63,12 @@ export async function runScrapeForKeyword(keywordTerm: string): Promise<RunScrap
   const term = keywordTerm.trim();
   if (!term) throw new Error("Keyword must not be empty.");
 
+  // update also revives a keyword mid-way through its 24h trash window —
+  // otherwise a re-scrape would attach new posts to a row about to be purged.
   const keyword = await prisma.keyword.upsert({
     where: { term },
     create: { term },
-    update: {},
+    update: { deletedAt: null, purgeAt: null },
   });
 
   // 1) Apify — the only source of raw data.
@@ -216,6 +257,7 @@ async function upsertComment(
 async function alertNegativePost(id: string): Promise<boolean> {
   const post = await prisma.post.findUnique({ where: { id }, include: { keyword: true } });
   if (!post || post.sentiment !== "NEGATIVE" || post.alertSent || post.isCompetitor) return false;
+  if (post.relevant === false) return false; // off-topic negative mentions don't count as brand press
 
   const platform = post.platform || (post.url?.includes("quora") ? "quora" : post.url?.includes("teamblind") ? "teamblind" : "reddit");
   const sent = await sendNegativeMentionAlert({
@@ -239,6 +281,7 @@ async function alertNegativePost(id: string): Promise<boolean> {
 async function alertNegativeComment(id: string): Promise<boolean> {
   const comment = await prisma.comment.findUnique({ where: { id }, include: { keyword: true, post: true } });
   if (!comment || comment.sentiment !== "NEGATIVE" || comment.alertSent || comment.isCompetitor) return false;
+  if (comment.relevant === false) return false;
 
   const platform = comment.post?.platform || (comment.url?.includes("quora") ? "quora" : comment.url?.includes("teamblind") ? "teamblind" : "reddit");
   const sent = await sendNegativeMentionAlert({
@@ -258,8 +301,14 @@ async function alertNegativeComment(id: string): Promise<boolean> {
   return sent;
 }
 
-/** Analyzes a single post by id. Returns true if it ended ANALYZED. Sends email alert for negative post. */
-export async function analyzePost(id: string): Promise<boolean> {
+/**
+ * Analyzes a single post by id: relevance check + sentiment in one AI call
+ * (see sentimentService.classifyMention). Returns true if it ended ANALYZED.
+ * Sends email alert for a negative post that's also relevant.
+ * `subjectOverride` lets competitor items check relevance against the
+ * competitor's own name instead of the brand (see routes/competitors.ts).
+ */
+export async function analyzePost(id: string, subjectOverride?: string): Promise<boolean> {
   const post = await prisma.post.findUnique({ where: { id } });
   if (!post) return false;
 
@@ -273,13 +322,19 @@ export async function analyzePost(id: string): Promise<boolean> {
 
   await prisma.post.update({ where: { id }, data: { status: ProcessingStatus.PROCESSING } });
   try {
-    const result = await classifySentiment(post.text);
+    const result = await classifyMention({
+      text: post.text,
+      subject: subjectOverride ?? BRAND_GROUP_NAME,
+      subjectVariants: subjectOverride ? undefined : BRAND_NAME_VARIANTS,
+    });
     await prisma.post.update({
       where: { id },
       data: {
         status: ProcessingStatus.ANALYZED,
         sentiment: result.sentiment,
         confidence: result.confidence,
+        relevant: result.relevant,
+        relevanceReason: describeRelevanceMethod(result.relevanceMethod),
         processingError: null,
         analyzedAt: new Date(),
       },
@@ -300,8 +355,13 @@ export async function analyzePost(id: string): Promise<boolean> {
   return true;
 }
 
-/** Analyzes a single comment by id. Returns true if it ended ANALYZED. Sends email alert for negative comment. */
-export async function analyzeComment(id: string): Promise<boolean> {
+/**
+ * Analyzes a single comment by id. Same relevance+sentiment behavior as
+ * analyzePost, plus reply-context assembly: if this comment has a post
+ * and/or is itself a reply to another comment, that context is included in
+ * the classification call instead of judging the reply in total isolation.
+ */
+export async function analyzeComment(id: string, subjectOverride?: string): Promise<boolean> {
   const comment = await prisma.comment.findUnique({ where: { id } });
   if (!comment) return false;
 
@@ -315,13 +375,21 @@ export async function analyzeComment(id: string): Promise<boolean> {
 
   await prisma.comment.update({ where: { id }, data: { status: ProcessingStatus.PROCESSING } });
   try {
-    const result = await classifySentiment(comment.text);
+    const context = await buildReplyContext(comment);
+    const result = await classifyMention({
+      text: comment.text,
+      subject: subjectOverride ?? BRAND_GROUP_NAME,
+      subjectVariants: subjectOverride ? undefined : BRAND_NAME_VARIANTS,
+      context,
+    });
     await prisma.comment.update({
       where: { id },
       data: {
         status: ProcessingStatus.ANALYZED,
         sentiment: result.sentiment,
         confidence: result.confidence,
+        relevant: result.relevant,
+        relevanceReason: describeRelevanceMethod(result.relevanceMethod),
         processingError: null,
         analyzedAt: new Date(),
       },
@@ -353,6 +421,8 @@ function backlogWhere() {
       { status: ProcessingStatus.FAILED },
       { status: ProcessingStatus.PROCESSING, updatedAt: { lt: new Date(Date.now() - STALE_PROCESSING_MS) } },
     ],
+    // A soft-deleted item sitting in its trash window shouldn't be analyzed.
+    deletedAt: null,
   };
 }
 
@@ -375,7 +445,7 @@ export async function analyzeBacklog(limit = 200): Promise<{ total: number; anal
 
 /** Retries alerts for NEGATIVE items whose email never went out (e.g. SMTP was down or unconfigured). */
 export async function sendPendingAlerts(limit = 50): Promise<{ pending: number; sent: number }> {
-  const where = { sentiment: "NEGATIVE", alertSent: false, isCompetitor: false };
+  const where = { sentiment: "NEGATIVE", alertSent: false, isCompetitor: false, relevant: { not: false }, deletedAt: null };
   const posts = await prisma.post.findMany({ where, select: { id: true }, orderBy: { createdAt: "asc" }, take: limit });
   const comments = await prisma.comment.findMany({
     where,

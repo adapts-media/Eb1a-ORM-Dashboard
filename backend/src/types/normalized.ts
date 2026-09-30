@@ -47,3 +47,20 @@ export interface SentimentResult {
   sentiment: SentimentLabel;
   confidence: number | null;
 }
+
+// How relevance was determined for a classifyMention() call — kept so the
+// DB/UI can show *why* without asking the AI to spend extra output tokens
+// generating a free-text explanation for the common (name-present) case.
+export type RelevanceMethod = "not_checked" | "keyword_match" | "ai_check";
+
+export interface MentionContext {
+  postTitle?: string | null;
+  parentText?: string | null;
+}
+
+export interface MentionClassification {
+  sentiment: SentimentLabel;
+  confidence: number | null;
+  relevant: boolean | null;
+  relevanceMethod: RelevanceMethod;
+}

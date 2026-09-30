@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma";
 import { runPythonSocialScraper } from "../services/pythonScraperService";
 import { runManualScrapePipeline } from "./manualScraper";
 import { getCronStatus, executeHourlyScrapeCycle } from "../services/cronScheduler";
+import { computePurgeAt, logDeletion, logRestore } from "../services/queryService";
 
 export const platformKeywordsRouter = Router();
 
@@ -19,6 +20,7 @@ const DEFAULT_SEEDS = [
 platformKeywordsRouter.get("/", async (_req, res, next) => {
   try {
     let cards = await (prisma as any).platformKeyword.findMany({
+      where: { deletedAt: null },
       orderBy: { createdAt: "desc" },
     });
 
@@ -32,6 +34,7 @@ platformKeywordsRouter.get("/", async (_req, res, next) => {
         }
       }
       cards = await (prisma as any).platformKeyword.findMany({
+        where: { deletedAt: null },
         orderBy: { createdAt: "desc" },
       });
     }
@@ -72,12 +75,21 @@ platformKeywordsRouter.post("/", async (req, res, next) => {
       }
     }
 
-    const created = await (prisma as any).platformKeyword.create({
-      data: {
+    // Upsert also revives a soft-deleted card with the same platform+keyword
+    // instead of hitting the unique-constraint 409 until its trash window expires.
+    const created = await (prisma as any).platformKeyword.upsert({
+      where: { platform_keyword: { platform: cleanPlatform, keyword: cleanKeyword } },
+      create: {
         platform: cleanPlatform,
         keyword: cleanKeyword,
         searchUrl: defaultUrl,
         enabled: true,
+      },
+      update: {
+        searchUrl: defaultUrl,
+        enabled: true,
+        deletedAt: null,
+        purgeAt: null,
       },
     });
 
@@ -90,16 +102,42 @@ platformKeywordsRouter.post("/", async (req, res, next) => {
   }
 });
 
-// DELETE /api/platform-keywords/:id — delete a keyword card
+// DELETE /api/platform-keywords/:id — soft-deletes a keyword card with a
+// 24h undo window instead of removing it immediately.
 platformKeywordsRouter.delete("/:id", async (req, res, next) => {
   try {
     const { id } = req.params;
-    try {
-      await (prisma as any).platformKeyword.delete({ where: { id } });
-    } catch (e) {
-      // ignore if already deleted
+    const { actor } = req.body ?? {};
+
+    const card = await (prisma as any).platformKeyword.findUnique({ where: { id } });
+    if (!card) {
+      // Already gone — treat as success for idempotency, same as before.
+      return res.json({ ok: true, message: "Keyword card deleted successfully." });
     }
-    res.json({ ok: true, message: "Keyword card deleted successfully." });
+
+    const purgeAt = computePurgeAt();
+    await (prisma as any).platformKeyword.update({ where: { id }, data: { deletedAt: new Date(), purgeAt } });
+    await logDeletion("PlatformKeyword", id, `${card.platform}: ${card.keyword}`, typeof actor === "string" ? actor : undefined);
+
+    res.json({ ok: true, message: "Keyword card moved to trash. It can be restored within 24 hours.", purgeAt });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/platform-keywords/:id/restore — undoes a delete within the grace window
+platformKeywordsRouter.post("/:id/restore", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const card = await (prisma as any).platformKeyword.findUnique({ where: { id } });
+    if (!card || !card.deletedAt) {
+      return res.status(404).json({ error: "Keyword card not found in trash." });
+    }
+
+    const restored = await (prisma as any).platformKeyword.update({ where: { id }, data: { deletedAt: null, purgeAt: null } });
+    await logRestore("PlatformKeyword", id);
+
+    res.json({ ok: true, card: restored, message: "Keyword card restored." });
   } catch (err) {
     next(err);
   }

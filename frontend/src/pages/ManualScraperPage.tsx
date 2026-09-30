@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import type { ManualScrapeResult, PlatformKeywordCard, CronStatus } from "../api/types";
 import { ItemList } from "../components/ItemList";
+import { UndoToast, type PendingDeletion } from "../components/UndoToast";
+import { getActorName } from "../lib/actor";
 
 export function ManualScraperPage() {
   const [platform, setPlatform] = useState<"reddit" | "quora" | "teamblind" | "trustpilot" | "linkedin" | "all">("reddit");
@@ -18,6 +20,7 @@ export function ManualScraperPage() {
   const [result, setResult] = useState<ManualScrapeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
+  const [pendingUndo, setPendingUndo] = useState<PendingDeletion | null>(null);
 
   useEffect(() => {
     loadCardsAndStatus();
@@ -74,10 +77,19 @@ export function ManualScraperPage() {
   }
 
   async function handleDeleteCard(id: string) {
-    if (!window.confirm("Are you sure you want to remove this keyword card?")) return;
+    const card = cards.find((c) => c.id === id);
+    if (!window.confirm("Remove this keyword card? You can undo this for the next 24 hours.")) return;
     try {
-      await api.deletePlatformCard(id);
+      const actor = getActorName();
+      await api.deletePlatformCard(id, actor);
       await loadCardsAndStatus();
+      setPendingUndo({
+        label: `"${card?.keyword ?? "Keyword"}" card removed`,
+        undo: async () => {
+          await api.restorePlatformCard(id);
+          await loadCardsAndStatus();
+        },
+      });
     } catch (err: any) {
       setError(err.message || "Failed to delete card.");
     }
@@ -504,6 +516,8 @@ export function ManualScraperPage() {
           <ItemList items={feedItems} emptyMessage="No posts or comments found for this query." />
         </>
       )}
+
+      <UndoToast pending={pendingUndo} onDismiss={() => setPendingUndo(null)} />
     </div>
   );
 }

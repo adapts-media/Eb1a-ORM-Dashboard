@@ -107,6 +107,11 @@ export interface ItemFiltersQuery {
 
 export interface SentimentByKeywordRow extends Overview {
   keyword: string;
+  // Feature: merge duplicate brand trackers. Present only for a merged
+  // profile — the original per-variant numbers, still visible on request.
+  isGroup?: boolean;
+  groupId?: string;
+  variants?: SentimentByKeywordRow[];
 }
 
 export interface SentimentByPlatformRow extends Overview {
@@ -208,6 +213,9 @@ export interface CompetitorCard {
   keyword: string;
   searchUrl?: string | null;
   enabled: boolean;
+  // Feature: turn on sentiment scoring for competitors. Opt-in per card;
+  // off = items are stamped NEUTRAL with zero AI spend.
+  sentimentEnabled?: boolean;
   lastRunAt?: string | null;
   createdAt: string;
   updatedAt: string;

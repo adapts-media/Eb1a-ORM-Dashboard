@@ -146,7 +146,8 @@ function toGoogleMention(post: any) {
 
 /** Reads Google-sourced mentions out of Postgres, applying the page's platform/query filters. */
 export async function fetchGoogleMentions(platform = "All", query = "", limit = 2000) {
-  const where: any = { source: GOOGLE_SOURCE, isCompetitor: false };
+  const baseWhere = { source: GOOGLE_SOURCE, isCompetitor: false, deletedAt: null };
+  const where: any = { ...baseWhere };
   if (platform && platform.toLowerCase() !== "all") {
     where.platform = { equals: platform, mode: "insensitive" };
   }
@@ -166,10 +167,10 @@ export async function fetchGoogleMentions(platform = "All", query = "", limit = 
       take: Math.min(Math.max(limit, 1), 5000),
       include: { keyword: { select: { term: true } } },
     }),
-    prisma.post.count({ where: { source: GOOGLE_SOURCE, isCompetitor: false } }),
+    prisma.post.count({ where: baseWhere }),
     prisma.post.groupBy({
       by: ["platform"],
-      where: { source: GOOGLE_SOURCE, isCompetitor: false },
+      where: baseWhere,
       _count: true,
     }),
   ]);
@@ -337,7 +338,7 @@ export async function autoIngestGoogleItems(items: any[], keyword?: string) {
   const dbKeyword = await prisma.keyword.upsert({
     where: { term },
     create: { term },
-    update: {},
+    update: { deletedAt: null, purgeAt: null },
   });
 
   const scrapeRun = await prisma.scrapeRun.create({

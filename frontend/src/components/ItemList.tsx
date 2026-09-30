@@ -1,7 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { FeedItem } from "../api/types";
 import { SentimentBadge, ConfidenceBar } from "./SentimentBadge";
 import { api } from "../api/client";
+import { getActorName } from "../lib/actor";
+
+const UNDO_WINDOW_SECONDS = 8;
 
 function formatDate(iso: string | null): string {
   if (!iso) return "Unknown date";
@@ -34,6 +37,18 @@ export function ItemList({
 function ItemCard({ item, onRetried }: { item: FeedItem; onRetried?: () => void }) {
   const [retrying, setRetrying] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Feature: "add a safety net before deleting anything". The delete below
+  // is a server-side soft delete either way (24h recoverable), this local
+  // state just controls whether the card shows an inline "Undo" for a few
+  // seconds before the list refresh removes it from view.
+  const [justDeleted, setJustDeleted] = useState(false);
+
+  useEffect(() => {
+    if (!justDeleted) return;
+    const timer = setTimeout(() => onRetried?.(), UNDO_WINDOW_SECONDS * 1000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [justDeleted]);
 
   async function retry() {
     setRetrying(true);
@@ -51,17 +66,39 @@ function ItemCard({ item, onRetried }: { item: FeedItem; onRetried?: () => void 
 
   async function handleDelete() {
     const typeLabel = displayType.toLowerCase();
-    if (!window.confirm(`Are you sure you want to permanently delete this ${typeLabel}?`)) return;
+    if (!window.confirm(`Delete this ${typeLabel}? You can undo this for the next 24 hours.`)) return;
     setDeleting(true);
     try {
-      if (item.type === "post") await api.deletePost(item.id);
-      else await api.deleteComment(item.id);
-      onRetried?.();
+      const actor = getActorName();
+      if (item.type === "post") await api.deletePost(item.id, actor);
+      else await api.deleteComment(item.id, actor);
+      setJustDeleted(true);
     } catch (err: any) {
       alert(`Failed to delete item: ${err.message || String(err)}`);
     } finally {
       setDeleting(false);
     }
+  }
+
+  async function handleUndo() {
+    try {
+      if (item.type === "post") await api.restorePost(item.id);
+      else await api.restoreComment(item.id);
+    } finally {
+      setJustDeleted(false);
+      onRetried?.();
+    }
+  }
+
+  if (justDeleted) {
+    return (
+      <div className="item-card" style={{ opacity: 0.6, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 13, color: "var(--text-dim)" }}>Deleted — recoverable for 24h.</span>
+        <button type="button" onClick={handleUndo} style={{ background: "transparent", border: "none", color: "#60a5fa", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+          UNDO
+        </button>
+      </div>
+    );
   }
 
   const sourceUrl = item.url ?? (item.type === "comment" ? item.post?.url : null) ?? null;

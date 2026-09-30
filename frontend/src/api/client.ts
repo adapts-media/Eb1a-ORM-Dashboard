@@ -107,7 +107,12 @@ export const api = {
 
   getKeywords: () => request<{ keywords: KeywordSummary[] }>("/keywords"),
 
-  deleteKeyword: (id: string) => request<{ ok: boolean; message: string }>(`/keywords/${id}`, { method: "DELETE" }),
+  // Deletion safety net: DELETE now soft-deletes with a 24h undo window —
+  // the response's `purgeAt` is when it will actually be removed. `actor`
+  // is a free-text name (this app has no login system) for the audit log.
+  deleteKeyword: (id: string, actor?: string) =>
+    request<{ ok: boolean; message: string; purgeAt?: string }>(`/keywords/${id}`, { method: "DELETE", body: JSON.stringify({ actor }) }),
+  restoreKeyword: (id: string) => request<{ ok: boolean; message: string }>(`/keywords/${id}/restore`, { method: "POST" }),
 
   scrapeKeyword: (keyword: string) =>
     request<ScrapeResult>("/keywords/scrape", { method: "POST", body: JSON.stringify({ keyword }) }),
@@ -143,10 +148,12 @@ export const api = {
     request<{ ok: boolean; deletedPosts: number; deletedComments: number; totalDeleted: number }>("/retry/all", {
       method: "DELETE",
     }),
-  deletePost: (id: string) =>
-    request<{ ok: boolean; id: string }>(`/items/post/${id}`, { method: "DELETE" }),
-  deleteComment: (id: string) =>
-    request<{ ok: boolean; id: string }>(`/items/comment/${id}`, { method: "DELETE" }),
+  deletePost: (id: string, actor?: string) =>
+    request<{ ok: boolean; id: string; purgeAt?: string }>(`/items/post/${id}`, { method: "DELETE", body: JSON.stringify({ actor }) }),
+  restorePost: (id: string) => request<{ ok: boolean; id: string }>(`/items/post/${id}/restore`, { method: "POST" }),
+  deleteComment: (id: string, actor?: string) =>
+    request<{ ok: boolean; id: string; purgeAt?: string }>(`/items/comment/${id}`, { method: "DELETE", body: JSON.stringify({ actor }) }),
+  restoreComment: (id: string) => request<{ ok: boolean; id: string }>(`/items/comment/${id}/restore`, { method: "POST" }),
   deleteFailedPost: (id: string) =>
     request<{ ok: boolean; id: string }>(`/items/post/${id}`, { method: "DELETE" }),
   deleteFailedComment: (id: string) =>
@@ -166,8 +173,10 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  deletePlatformCard: (id: string) =>
-    request<{ ok: boolean; message: string }>(`/platform-keywords/${id}`, { method: "DELETE" }),
+  deletePlatformCard: (id: string, actor?: string) =>
+    request<{ ok: boolean; message: string; purgeAt?: string }>(`/platform-keywords/${id}`, { method: "DELETE", body: JSON.stringify({ actor }) }),
+  restorePlatformCard: (id: string) =>
+    request<{ ok: boolean; card: PlatformKeywordCard; message: string }>(`/platform-keywords/${id}/restore`, { method: "POST" }),
 
   togglePlatformCard: (id: string) =>
     request<{ ok: boolean; card: PlatformKeywordCard }>(`/platform-keywords/${id}/toggle`, { method: "PATCH" }),
@@ -212,11 +221,16 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  deleteCompetitorCard: (id: string) =>
-    request<{ ok: boolean; message: string }>(`/competitor-cards/cards/${id}`, { method: "DELETE" }),
+  deleteCompetitorCard: (id: string, actor?: string) =>
+    request<{ ok: boolean; message: string; purgeAt?: string }>(`/competitor-cards/cards/${id}`, { method: "DELETE", body: JSON.stringify({ actor }) }),
+  restoreCompetitorCard: (id: string) =>
+    request<{ ok: boolean; card: CompetitorCard; message: string }>(`/competitor-cards/cards/${id}/restore`, { method: "POST" }),
 
   toggleCompetitorCard: (id: string) =>
     request<{ ok: boolean; card: CompetitorCard }>(`/competitor-cards/cards/${id}/toggle`, { method: "PATCH" }),
+
+  toggleCompetitorSentiment: (id: string) =>
+    request<{ ok: boolean; card: CompetitorCard }>(`/competitor-cards/cards/${id}/toggle-sentiment`, { method: "PATCH" }),
 
   runCompetitorCardNow: (id: string) =>
     request<{ ok: boolean; result: any }>(`/competitor-cards/cards/run-card/${id}`, { method: "POST" }),

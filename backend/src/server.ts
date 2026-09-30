@@ -13,7 +13,7 @@ import { googleScraperRouter } from "./routes/googleScraper";
 import { competitorsRouter, syncCompetitorFlags } from "./routes/competitors";
 import { exportRouter } from "./routes/export";
 import { startHourlyScraperCron } from "./services/cronScheduler";
-import { purgeSeedKeyword } from "./services/queryService";
+import { purgeSeedKeyword, ensureBrandKeywordGroup } from "./services/queryService";
 
 const app = express();
 
@@ -24,6 +24,9 @@ try {
   refreshEnvFromDisk().catch(() => {});
   purgeSeedKeyword().catch(() => {});
   syncCompetitorFlags().catch(() => {});
+  // Feature: "merge duplicate brand trackers" — groups the brand's known
+  // spelling variants under one profile on boot.
+  ensureBrandKeywordGroup().catch(() => {});
 } catch (err: any) {
   console.warn("Notice: Prisma DB sync notice:", err?.message || err);
 }

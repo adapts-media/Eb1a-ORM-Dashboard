@@ -2,13 +2,15 @@ import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import type { CompetitorCard, FeedItem, ItemsResponse } from "../api/types";
 import { ItemList } from "../components/ItemList";
+import { UndoToast, type PendingDeletion } from "../components/UndoToast";
+import { getActorName } from "../lib/actor";
 
 const PAGE_SIZE = 20;
 
 export function CompetitorAnalysisPage() {
   const [platform, setPlatform] = useState<string>("all");
   const [cards, setCards] = useState<CompetitorCard[]>([]);
-  
+
   // New competitor card form state
   const [formPlatform, setFormPlatform] = useState<string>("reddit");
   const [newKeyword, setNewKeyword] = useState("");
@@ -18,6 +20,7 @@ export function CompetitorAnalysisPage() {
   const [runningAll, setRunningAll] = useState(false);
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pendingUndo, setPendingUndo] = useState<PendingDeletion | null>(null);
 
   // Feed items state
   const [data, setData] = useState<ItemsResponse | null>(null);
@@ -82,11 +85,32 @@ export function CompetitorAnalysisPage() {
     }
   }
 
-  async function handleDeleteCard(id: string) {
-    if (!confirm("Are you sure you want to delete this competitor card?")) return;
+  // Feature: "turn on sentiment scoring for competitors" — opt-in per card,
+  // off by default. When on, new mentions for this competitor get real AI
+  // sentiment analysis instead of a stamped NEUTRAL placeholder.
+  async function handleToggleSentiment(id: string) {
     try {
-      await api.deleteCompetitorCard(id);
+      await api.toggleCompetitorSentiment(id);
       await loadCards();
+    } catch (err: any) {
+      setError(err.message || "Failed to toggle sentiment scoring.");
+    }
+  }
+
+  async function handleDeleteCard(id: string) {
+    const card = cards.find((c) => c.id === id);
+    if (!confirm("Delete this competitor card? You can undo this for the next 24 hours.")) return;
+    try {
+      const actor = getActorName();
+      await api.deleteCompetitorCard(id, actor);
+      await loadCards();
+      setPendingUndo({
+        label: `Competitor card "${card?.keyword ?? ""}" deleted`,
+        undo: async () => {
+          await api.restoreCompetitorCard(id);
+          await loadCards();
+        },
+      });
     } catch (err: any) {
       setError(err.message || "Failed to delete card.");
     }
@@ -99,7 +123,8 @@ export function CompetitorAnalysisPage() {
       setSuccessBanner(null);
       const res = await api.runCompetitorCardNow(card.id);
       const newCount = (res.result?.postsCreated || 0) + (res.result?.commentsCreated || 0);
-      setSuccessBanner(`✓ Scraped competitor card "${card.keyword}": Added ${newCount} new competitor mention(s) (no AI sentiment used).`);
+      const sentimentUsed = res.result?.sentimentEnabled ?? card.sentimentEnabled;
+      setSuccessBanner(`✓ Scraped competitor card "${card.keyword}": Added ${newCount} new competitor mention(s) (${sentimentUsed ? "AI sentiment analyzed" : "no AI sentiment used"}).`);
       await loadCards();
       fetchFeedData();
     } catch (err: any) {
@@ -136,7 +161,7 @@ export function CompetitorAnalysisPage() {
         <div>
           <h2>🥊 Competitor Analysis</h2>
           <p style={{ margin: "4px 0 0", color: "var(--text-dim)", fontSize: 13 }}>
-            Monitor competitor brand mentions across Reddit, Quora, TeamBlind, Trustpilot &amp; Web. Raw scraping only (no AI sentiment tokens spent).
+            Monitor competitor brand mentions across Reddit, Quora, TeamBlind, Trustpilot &amp; Web. AI sentiment scoring is opt-in per card below — off by default (no tokens spent) until you turn it on.
           </p>
         </div>
 
@@ -277,9 +302,21 @@ export function CompetitorAnalysisPage() {
                   </div>
 
                   <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 4 }}>{card.keyword}</div>
-                  <div style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 12 }}>
+                  <div style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 8 }}>
                     Last run: {card.lastRunAt ? new Date(card.lastRunAt).toLocaleString() : "Never"}
                   </div>
+
+                  <label
+                    title="When on, new mentions of this competitor get real AI sentiment analysis instead of a stamped NEUTRAL placeholder. This is the only enhancement with ongoing AI cost, so it stays off until you turn it on here."
+                    style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 6, cursor: "pointer", marginBottom: 8, color: card.sentimentEnabled ? "var(--accent)" : "var(--text-dim)" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={Boolean(card.sentimentEnabled)}
+                      onChange={() => handleToggleSentiment(card.id)}
+                    />
+                    AI sentiment scoring {card.sentimentEnabled ? "ON" : "OFF"}
+                  </label>
                 </div>
 
                 <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
@@ -351,6 +388,8 @@ export function CompetitorAnalysisPage() {
           </>
         )}
       </div>
+
+      <UndoToast pending={pendingUndo} onDismiss={() => setPendingUndo(null)} />
     </div>
   );
 }

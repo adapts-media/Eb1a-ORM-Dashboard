@@ -7,8 +7,14 @@ import {
   getPositiveItems,
   globalSearch,
   getFailedItems,
+  computePurgeAt,
+  logDeletion,
+  logRestore,
+  softDeleteCommentTree,
+  restoreCommentTree,
 } from "../services/queryService";
 import { ItemFilters } from "../services/queryService";
+import { prisma } from "../lib/prisma";
 
 export const itemsRouter = Router();
 
@@ -89,30 +95,79 @@ itemsRouter.get("/search", async (req, res) => {
   res.json(result);
 });
 
-// DELETE /api/items/post/:id or /api/post/:id — delete a specific post & its comments
+// DELETE /api/items/post/:id or /api/post/:id — soft-deletes a post (and its
+// comments, on the same grace window) with a 24h undo window instead of
+// deleting it immediately (see services/queryService.ts).
 itemsRouter.delete(["/items/post/:id", "/post/:id"], async (req, res) => {
   try {
     const id = req.params.id;
-    const { prisma } = await import("../lib/prisma");
-    await prisma.comment.deleteMany({ where: { postId: id } });
-    await prisma.post.delete({ where: { id } });
-    res.json({ ok: true, message: "Post deleted successfully", id });
+    const actor = typeof req.body?.actor === "string" ? req.body.actor : undefined;
+
+    const post = await prisma.post.findUnique({ where: { id } });
+    if (!post) return res.status(404).json({ error: "Post not found" });
+
+    const now = new Date();
+    const purgeAt = computePurgeAt();
+    await prisma.comment.updateMany({ where: { postId: id, deletedAt: null }, data: { deletedAt: now, purgeAt } });
+    await prisma.post.update({ where: { id }, data: { deletedAt: now, purgeAt } });
+    await logDeletion("Post", id, post.title || post.text?.slice(0, 120) || post.url || id, actor);
+
+    res.json({ ok: true, message: "Post moved to trash. It can be restored within 24 hours.", id, purgeAt });
   } catch (err: any) {
     console.error("Error deleting post:", err);
     res.status(500).json({ error: err?.message || "Failed to delete post" });
   }
 });
 
-// DELETE /api/items/comment/:id or /api/comment/:id — delete a specific comment
+// POST /api/items/post/:id/restore — undoes a post delete within the grace window
+itemsRouter.post(["/items/post/:id/restore", "/post/:id/restore"], async (req, res) => {
+  try {
+    const id = req.params.id;
+    const post = await prisma.post.findUnique({ where: { id } });
+    if (!post || !post.deletedAt) return res.status(404).json({ error: "Post not found in trash." });
+
+    await prisma.comment.updateMany({ where: { postId: id, purgeAt: post.purgeAt ?? undefined }, data: { deletedAt: null, purgeAt: null } });
+    await prisma.post.update({ where: { id }, data: { deletedAt: null, purgeAt: null } });
+    await logRestore("Post", id);
+
+    res.json({ ok: true, message: "Post restored.", id });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Failed to restore post" });
+  }
+});
+
+// DELETE /api/items/comment/:id or /api/comment/:id — soft-deletes a comment
+// (and its descendant replies) with a 24h undo window.
 itemsRouter.delete(["/items/comment/:id", "/comment/:id"], async (req, res) => {
   try {
     const id = req.params.id;
-    const { prisma } = await import("../lib/prisma");
-    await prisma.comment.delete({ where: { id } });
-    res.json({ ok: true, message: "Comment deleted successfully", id });
+    const actor = typeof req.body?.actor === "string" ? req.body.actor : undefined;
+
+    const comment = await prisma.comment.findUnique({ where: { id } });
+    if (!comment) return res.status(404).json({ error: "Comment not found" });
+
+    const { purgeAt } = await softDeleteCommentTree(id);
+    await logDeletion("Comment", id, comment.text?.slice(0, 120) || comment.url || id, actor);
+
+    res.json({ ok: true, message: "Comment moved to trash. It can be restored within 24 hours.", id, purgeAt });
   } catch (err: any) {
     console.error("Error deleting comment:", err);
     res.status(500).json({ error: err?.message || "Failed to delete comment" });
   }
 });
 
+// POST /api/items/comment/:id/restore — undoes a comment delete within the grace window
+itemsRouter.post(["/items/comment/:id/restore", "/comment/:id/restore"], async (req, res) => {
+  try {
+    const id = req.params.id;
+    const comment = await prisma.comment.findUnique({ where: { id } });
+    if (!comment || !comment.deletedAt) return res.status(404).json({ error: "Comment not found in trash." });
+
+    await restoreCommentTree(id);
+    await logRestore("Comment", id);
+
+    res.json({ ok: true, message: "Comment restored.", id });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Failed to restore comment" });
+  }
+});

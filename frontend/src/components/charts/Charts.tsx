@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   PieChart,
   Pie,
@@ -76,6 +77,34 @@ export function SentimentByKeywordChart({ data }: { data: SentimentByKeywordRow[
   );
 }
 
+function SentimentBarsInner({ positivePct, neutralPct, negativePct }: { positivePct: number; neutralPct: number; negativePct: number }) {
+  const bars = [
+    { label: "Positive", pct: positivePct, color: COLORS.POSITIVE },
+    { label: "Neutral", pct: neutralPct, color: COLORS.NEUTRAL },
+    { label: "Negative", pct: negativePct, color: COLORS.NEGATIVE },
+  ];
+  return (
+    <>
+      {bars.map((b) => (
+        <div key={b.label} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, fontSize: 12 }}>
+          <span style={{ width: 56, color: "var(--text-dim)" }}>{b.label}</span>
+          <div style={{ flex: 1, background: "var(--bg-panel)", borderRadius: 4, height: 10, overflow: "hidden" }}>
+            <div style={{ width: `${b.pct}%`, background: b.color, height: "100%" }} />
+          </div>
+          <span style={{ width: 40, textAlign: "right", fontWeight: 600 }}>{b.pct}%</span>
+        </div>
+      ))}
+    </>
+  );
+}
+
+/**
+ * Feature: "merge duplicate brand trackers into one". When `row.isGroup` is
+ * set (a merged KeywordGroup — see services/queryService.ts
+ * getSentimentByKeyword), the combined numbers show by default with a
+ * "N variants" expand toggle revealing the original per-variant rows
+ * underneath, instead of the brand being split across N separate cards.
+ */
 export function KeywordSentimentBars({
   row,
   onDelete,
@@ -83,16 +112,25 @@ export function KeywordSentimentBars({
   row: SentimentByKeywordRow;
   onDelete?: (keyword: string) => void;
 }) {
-  const bars = [
-    { label: "Positive", pct: row.positivePct, color: COLORS.POSITIVE },
-    { label: "Neutral", pct: row.neutralPct, color: COLORS.NEUTRAL },
-    { label: "Negative", pct: row.negativePct, color: COLORS.NEGATIVE },
-  ];
+  const [expanded, setExpanded] = useState(false);
+  const isGroup = Boolean(row.isGroup && row.variants && row.variants.length > 1);
+
   return (
     <div style={{ background: "var(--bg-panel-alt)", padding: "14px 16px", borderRadius: 8, border: "1px solid var(--border)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-        <div style={{ fontWeight: 600, fontSize: 13, color: "var(--text)" }}>{row.keyword}</div>
-        {onDelete && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ fontWeight: 600, fontSize: 13, color: "var(--text)" }}>{row.keyword}</div>
+          {isGroup && (
+            <span
+              title={`Merged from ${row.variants!.length} spelling variants`}
+              style={{ fontSize: 10, fontWeight: 700, color: "var(--text-dim)", border: "1px solid var(--border)", borderRadius: 999, padding: "1px 7px" }}
+            >
+              MERGED
+            </span>
+          )}
+        </div>
+        {/* Deleting "the group" is ambiguous — variants are managed via the seed list, not deleted individually here. */}
+        {onDelete && !isGroup && (
           <button
             type="button"
             title="Delete keyword"
@@ -111,15 +149,32 @@ export function KeywordSentimentBars({
           </button>
         )}
       </div>
-      {bars.map((b) => (
-        <div key={b.label} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, fontSize: 12 }}>
-          <span style={{ width: 56, color: "var(--text-dim)" }}>{b.label}</span>
-          <div style={{ flex: 1, background: "var(--bg-panel)", borderRadius: 4, height: 10, overflow: "hidden" }}>
-            <div style={{ width: `${b.pct}%`, background: b.color, height: "100%" }} />
-          </div>
-          <span style={{ width: 40, textAlign: "right", fontWeight: 600 }}>{b.pct}%</span>
-        </div>
-      ))}
+
+      <SentimentBarsInner positivePct={row.positivePct} neutralPct={row.neutralPct} negativePct={row.negativePct} />
+
+      {isGroup && (
+        <>
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            style={{ background: "transparent", border: "none", color: "#60a5fa", fontSize: 11, fontWeight: 600, cursor: "pointer", padding: "6px 0 0" }}
+          >
+            {expanded ? "Hide variants ▲" : `Show ${row.variants!.length} variants ▼`}
+          </button>
+          {expanded && (
+            <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed var(--border)", display: "grid", gap: 10 }}>
+              {row.variants!.map((v) => (
+                <div key={v.keyword}>
+                  <div style={{ fontSize: 11, color: "var(--text-dim)", marginBottom: 4 }}>
+                    {v.keyword} <span style={{ opacity: 0.7 }}>({v.totalMentions} mentions)</span>
+                  </div>
+                  <SentimentBarsInner positivePct={v.positivePct} neutralPct={v.neutralPct} negativePct={v.negativePct} />
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

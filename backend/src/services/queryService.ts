@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { Sentiment, SentimentValue } from "../types/status";
+import { BRAND_GROUP_NAME, BRAND_NAME_VARIANTS } from "../config/brand";
 
 export interface ItemFilters {
   keyword?: string;
@@ -21,6 +22,8 @@ export interface ItemFilters {
 function postWhere(f: ItemFilters): Prisma.PostWhereInput {
   const conditions: Prisma.PostWhereInput[] = [
     { isCompetitor: false },
+    // Deletion safety net: soft-deleted rows never show up in normal views.
+    { deletedAt: null },
   ];
 
   if (f.source) {
@@ -83,6 +86,7 @@ function postWhere(f: ItemFilters): Prisma.PostWhereInput {
 function commentWhere(f: ItemFilters): Prisma.CommentWhereInput {
   const conditions: Prisma.CommentWhereInput[] = [
     { isCompetitor: false },
+    { deletedAt: null },
   ];
 
   if (f.source === "google") {
@@ -218,6 +222,150 @@ export async function syncCompetitorFlags() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Feature: deletion safety net (24h soft-delete + undo + audit log)
+// ---------------------------------------------------------------------------
+
+export const DELETION_GRACE_PERIOD_MS = 24 * 60 * 60 * 1000;
+
+export function computePurgeAt(): Date {
+  return new Date(Date.now() + DELETION_GRACE_PERIOD_MS);
+}
+
+/**
+ * Records a soft-delete in the audit log. `label` is a short, human-readable
+ * snapshot captured at delete time so the log stays meaningful even after
+ * the row is purged. No auth/session system exists in this app, so `actor`
+ * is a best-effort free-text field the UI asks for, not a real user id.
+ */
+export async function logDeletion(entityType: string, entityId: string, label: string, actor?: string | null) {
+  try {
+    await prisma.deletionLog.create({
+      data: {
+        entityType,
+        entityId,
+        label: label.slice(0, 500),
+        actor: actor && actor.trim() ? actor.trim().slice(0, 200) : null,
+      },
+    });
+  } catch (e) {
+    console.warn(`Notice: failed to write DeletionLog entry for ${entityType}:${entityId}`, e);
+  }
+}
+
+/** Marks the most recent open DeletionLog entry for this entity as restored. */
+export async function logRestore(entityType: string, entityId: string) {
+  try {
+    await prisma.deletionLog.updateMany({
+      where: { entityType, entityId, restoredAt: null, purgedAt: null },
+      data: { restoredAt: new Date() },
+    });
+  } catch (e) {
+    console.warn(`Notice: failed to update DeletionLog entry for ${entityType}:${entityId}`, e);
+  }
+}
+
+/** Walks parentCommentId downward (any depth) to find a comment's full descendant set, itself included. */
+async function findCommentDescendantIds(rootId: string): Promise<string[]> {
+  const idsToProcess = [rootId];
+  const allIds: string[] = [];
+  while (idsToProcess.length > 0) {
+    const currentId = idsToProcess.shift()!;
+    allIds.push(currentId);
+    const children = await prisma.comment.findMany({ where: { parentCommentId: currentId }, select: { id: true } });
+    idsToProcess.push(...children.map((c) => c.id));
+  }
+  return allIds;
+}
+
+/** Soft-deletes a standalone comment and all of its descendant replies (any depth) with one shared purgeAt. */
+export async function softDeleteCommentTree(commentId: string): Promise<{ purgeAt: Date; affectedIds: string[] }> {
+  const affectedIds = await findCommentDescendantIds(commentId);
+  const deletedAt = new Date();
+  const purgeAt = computePurgeAt();
+  await prisma.comment.updateMany({ where: { id: { in: affectedIds } }, data: { deletedAt, purgeAt } });
+  return { purgeAt, affectedIds };
+}
+
+/** Restores a comment and its descendant replies that were soft-deleted alongside it. */
+export async function restoreCommentTree(commentId: string): Promise<string[]> {
+  const affectedIds = await findCommentDescendantIds(commentId);
+  await prisma.comment.updateMany({ where: { id: { in: affectedIds } }, data: { deletedAt: null, purgeAt: null } });
+  return affectedIds;
+}
+
+let lastPurgeTime = 0;
+
+/**
+ * Hard-deletes anything whose 24h grace window has passed. Lazy, throttled
+ * sweep (same pattern as syncCompetitorFlags above) rather than a dedicated
+ * cron job — piggybacks on whatever read touches an affected list next.
+ *
+ * Safe w.r.t. the Comment self-referencing FK (parentComment, onDelete:
+ * NoAction): every soft-delete route cascades the SAME deletedAt/purgeAt to
+ * a row's full descendant tree at delete time (a post's comments, or a
+ * comment's own replies), so by the time anything is due for purge, every
+ * row that still references it via parentCommentId/postId is either
+ * already gone or is purged in the very same deleteMany call — and Postgres
+ * only checks NO ACTION constraints at the end of each statement, so a
+ * whole connected subtree removed in one deleteMany never trips the FK.
+ */
+export async function purgeExpiredDeletions() {
+  const now = Date.now();
+  if (now - lastPurgeTime < 30000) return;
+  lastPurgeTime = now;
+
+  const cutoff = new Date();
+
+  try {
+    const expiredComments = await prisma.comment.findMany({ where: { purgeAt: { lte: cutoff } }, select: { id: true } });
+    if (expiredComments.length > 0) {
+      const ids = expiredComments.map((c) => c.id);
+      await prisma.comment.deleteMany({ where: { id: { in: ids } } });
+      await prisma.deletionLog.updateMany({ where: { entityType: "Comment", entityId: { in: ids }, purgedAt: null }, data: { purgedAt: cutoff } });
+    }
+
+    const expiredPosts = await prisma.post.findMany({ where: { purgeAt: { lte: cutoff } }, select: { id: true } });
+    if (expiredPosts.length > 0) {
+      const ids = expiredPosts.map((p) => p.id);
+      // Defensive: any comment still attached shouldn't exist (posts cascade
+      // the same purgeAt to their comments at delete time, so the sweep
+      // above already removed them), but this covers any edge case cleanly.
+      await prisma.comment.deleteMany({ where: { postId: { in: ids } } });
+      await prisma.post.deleteMany({ where: { id: { in: ids } } });
+      await prisma.deletionLog.updateMany({ where: { entityType: "Post", entityId: { in: ids }, purgedAt: null }, data: { purgedAt: cutoff } });
+    }
+
+    const expiredKeywords = await prisma.keyword.findMany({ where: { purgeAt: { lte: cutoff } }, select: { id: true } });
+    for (const kw of expiredKeywords) {
+      await prisma.comment.deleteMany({ where: { keywordId: kw.id } });
+      await prisma.post.deleteMany({ where: { keywordId: kw.id } });
+      await prisma.scrapeRun.deleteMany({ where: { keywordId: kw.id } });
+      await prisma.keyword.delete({ where: { id: kw.id } }).catch(() => {});
+    }
+    if (expiredKeywords.length > 0) {
+      const ids = expiredKeywords.map((k) => k.id);
+      await prisma.deletionLog.updateMany({ where: { entityType: "Keyword", entityId: { in: ids }, purgedAt: null }, data: { purgedAt: cutoff } });
+    }
+
+    const expiredPlatformCards = await (prisma as any).platformKeyword.findMany({ where: { purgeAt: { lte: cutoff } }, select: { id: true } }).catch(() => []);
+    if (expiredPlatformCards.length > 0) {
+      const ids = expiredPlatformCards.map((c: any) => c.id);
+      await (prisma as any).platformKeyword.deleteMany({ where: { id: { in: ids } } });
+      await prisma.deletionLog.updateMany({ where: { entityType: "PlatformKeyword", entityId: { in: ids }, purgedAt: null }, data: { purgedAt: cutoff } });
+    }
+
+    const expiredCompCards = await (prisma as any).competitorCard.findMany({ where: { purgeAt: { lte: cutoff } }, select: { id: true } }).catch(() => []);
+    if (expiredCompCards.length > 0) {
+      const ids = expiredCompCards.map((c: any) => c.id);
+      await (prisma as any).competitorCard.deleteMany({ where: { id: { in: ids } } });
+      await prisma.deletionLog.updateMany({ where: { entityType: "CompetitorCard", entityId: { in: ids }, purgedAt: null }, data: { purgedAt: cutoff } });
+    }
+  } catch (e) {
+    console.warn("Notice: purge sweep failed:", e);
+  }
+}
+
 export interface TrendBucket {
   total: number;
   positive: number;
@@ -296,6 +444,7 @@ export async function getOverview(
   source?: ItemFilters["source"]
 ) {
   await syncCompetitorFlags().catch(() => {});
+  await purgeExpiredDeletions().catch(() => {});
 
   const f: ItemFilters = {
     keyword,
@@ -355,6 +504,7 @@ export async function getOverview(
 
 export async function getItems(f: ItemFilters) {
   await syncCompetitorFlags().catch(() => {});
+  await purgeExpiredDeletions().catch(() => {});
 
   const page = f.page && f.page > 0 ? f.page : 1;
   const pageSize = f.pageSize && f.pageSize > 0 ? Math.min(f.pageSize, 200) : 50;
@@ -404,6 +554,7 @@ export async function getItems(f: ItemFilters) {
 export async function getKeywords() {
   await purgeSeedKeyword();
   await syncCompetitorFlags().catch(() => {});
+  await purgeExpiredDeletions().catch(() => {});
 
   const competitorCards = await (prisma as any).competitorCard.findMany().catch(() => []);
   const competitorTerms = new Set(competitorCards.map((c: any) => c.keyword.toLowerCase().trim()));
@@ -411,6 +562,7 @@ export async function getKeywords() {
   const all = await prisma.keyword.findMany({
     where: {
       term: { notIn: ["seed", "Seed", "SEED"] },
+      deletedAt: null,
     },
     orderBy: { createdAt: "desc" },
     include: { _count: { select: { posts: true, comments: true } } },
@@ -423,6 +575,73 @@ export async function getSentimentDistribution(keyword?: string, platform?: stri
   return getOverview(keyword, platform, dateFrom, dateTo);
 }
 
+// ---------------------------------------------------------------------------
+// Feature: merge duplicate brand trackers into one profile
+// ---------------------------------------------------------------------------
+
+/**
+ * One-time-ish bootstrap: groups the brand's known spelling variants under a
+ * single KeywordGroup so "Sentiment by Keyword" shows one merged card
+ * instead of one per variant. Deliberately an explicit, hardcoded variant
+ * list — not fuzzy matching — so a future unrelated keyword never gets
+ * silently folded into the brand. Safe to call repeatedly (upserts); the
+ * keyword upsert also revives a soft-deleted variant (clears
+ * deletedAt/purgeAt) so it doesn't stay in the trash if scraping resumes.
+ */
+export async function ensureBrandKeywordGroup() {
+  try {
+    const group = await (prisma as any).keywordGroup.upsert({
+      where: { name: BRAND_GROUP_NAME },
+      create: { name: BRAND_GROUP_NAME },
+      update: {},
+    });
+
+    for (const term of BRAND_NAME_VARIANTS) {
+      const kw = await prisma.keyword.upsert({
+        where: { term },
+        create: { term, groupId: group.id },
+        update: { deletedAt: null, purgeAt: null },
+      });
+      if (!(kw as any).groupId) {
+        await prisma.keyword.update({ where: { id: kw.id }, data: { groupId: group.id } });
+      }
+    }
+  } catch (e) {
+    console.warn("Notice: could not seed brand keyword group:", e);
+  }
+}
+
+function combineOverviews(rows: Array<Awaited<ReturnType<typeof getOverview>>>) {
+  const totalPosts = rows.reduce((s, r) => s + r.totalPosts, 0);
+  const totalComments = rows.reduce((s, r) => s + r.totalComments, 0);
+  const positive = rows.reduce((s, r) => s + r.positive, 0);
+  const negative = rows.reduce((s, r) => s + r.negative, 0);
+  const neutral = rows.reduce((s, r) => s + r.neutral, 0);
+  const totalAnalyzed = positive + negative + neutral;
+  const pct = (n: number) => (totalAnalyzed > 0 ? Math.round((n / totalAnalyzed) * 1000) / 10 : 0);
+
+  return {
+    totalPosts,
+    totalComments,
+    totalMentions: totalPosts + totalComments,
+    totalAnalyzed,
+    positive,
+    negative,
+    neutral,
+    positivePct: pct(positive),
+    negativePct: pct(negative),
+    neutralPct: pct(neutral),
+  };
+}
+
+/**
+ * Sentiment-by-keyword, with brand spelling variants merged into one row
+ * (feature: "merge duplicate brand trackers"). Keywords belonging to a
+ * KeywordGroup are combined into a single row labeled with the group's
+ * name; the original per-variant numbers are still returned in `variants`
+ * so the UI can show them on request. Ungrouped keywords behave exactly as
+ * before — one row each.
+ */
 export async function getSentimentByKeyword() {
   await purgeSeedKeyword();
   await syncCompetitorFlags().catch(() => {});
@@ -433,19 +652,54 @@ export async function getSentimentByKeyword() {
   const keywords = await prisma.keyword.findMany({
     where: {
       term: { notIn: ["seed", "Seed", "SEED"] },
+      deletedAt: null,
     },
+    include: { group: true },
   });
 
-  const results = [];
+  const standalone: typeof keywords = [];
+  const groupMap = new Map<string, { name: string; terms: string[] }>();
+
   for (const kw of keywords) {
     const termClean = kw.term.toLowerCase().trim();
     if (competitorTerms.has(termClean)) continue;
 
+    if ((kw as any).group) {
+      const g = (kw as any).group as { id: string; name: string };
+      const entry = groupMap.get(g.id) ?? { name: g.name, terms: [] };
+      entry.terms.push(kw.term);
+      groupMap.set(g.id, entry);
+    } else {
+      standalone.push(kw);
+    }
+  }
+
+  const results: any[] = [];
+
+  for (const kw of standalone) {
     const overview = await getOverview(kw.term);
     if (overview.totalMentions > 0) {
       results.push({ keyword: kw.term, ...overview });
     }
   }
+
+  for (const [groupId, group] of groupMap) {
+    const variants: any[] = [];
+    for (const term of group.terms) {
+      const overview = await getOverview(term);
+      if (overview.totalMentions > 0) variants.push({ keyword: term, ...overview });
+    }
+    if (variants.length === 0) continue;
+
+    results.push({
+      keyword: group.name,
+      ...combineOverviews(variants),
+      isGroup: true,
+      groupId,
+      variants,
+    });
+  }
+
   return results;
 }
 
@@ -510,18 +764,18 @@ export async function globalSearch(q: string, limit = 50) {
 
   const [posts, comments, keywords] = await Promise.all([
     prisma.post.findMany({
-      where: { OR: [{ text: { contains: query } }, { author: { contains: query } }] },
+      where: { deletedAt: null, OR: [{ text: { contains: query } }, { author: { contains: query } }] },
       include: { keyword: true },
       take: limit,
       orderBy: { publishedAt: "desc" },
     }),
     prisma.comment.findMany({
-      where: { OR: [{ text: { contains: query } }, { author: { contains: query } }] },
+      where: { deletedAt: null, OR: [{ text: { contains: query } }, { author: { contains: query } }] },
       include: { keyword: true },
       take: limit,
       orderBy: { publishedAt: "desc" },
     }),
-    prisma.keyword.findMany({ where: { term: { contains: query } } }),
+    prisma.keyword.findMany({ where: { term: { contains: query }, deletedAt: null } }),
   ]);
 
   return { posts, comments, keywords };
@@ -529,8 +783,8 @@ export async function globalSearch(q: string, limit = 50) {
 
 export async function getFailedItems() {
   const [posts, comments] = await Promise.all([
-    prisma.post.findMany({ where: { status: "FAILED" }, include: { keyword: true } }),
-    prisma.comment.findMany({ where: { status: "FAILED" }, include: { keyword: true } }),
+    prisma.post.findMany({ where: { status: "FAILED", deletedAt: null }, include: { keyword: true } }),
+    prisma.comment.findMany({ where: { status: "FAILED", deletedAt: null }, include: { keyword: true } }),
   ]);
   return { posts, comments };
 }

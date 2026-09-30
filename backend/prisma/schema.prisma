@@ -21,10 +21,16 @@ model PlatformKeyword {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
+  // Deletion safety net: a delete sets these instead of removing the row;
+  // a restore within the window clears them; a purge sweep hard-deletes
+  // once purgeAt has passed.
+  deletedAt   DateTime?
+  purgeAt     DateTime?
+
   @@unique([platform, keyword])
 }
 
-// Competitor Card registered for competitor analysis (basic scraping without AI sentiment analysis).
+// Competitor Card registered for competitor analysis.
 model CompetitorCard {
   id          String    @id @default(cuid())
   platform    String    // "reddit" | "quora" | "teamblind" | "trustpilot" | "all"
@@ -35,7 +41,28 @@ model CompetitorCard {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
+  // Opt-in switch for real AI sentiment analysis on this competitor's
+  // mentions. Off by default: items are stored with a stamped NEUTRAL
+  // placeholder and zero AI spend until a card explicitly opts in.
+  sentimentEnabled Boolean @default(false)
+
+  deletedAt   DateTime?
+  purgeAt     DateTime?
+
   @@unique([platform, keyword])
+}
+
+// Groups spelling variants of the same brand/entity ("EB1A Experts",
+// "EB-1A Experts", "eb1aexperts.com", ...) into one profile so the dashboard
+// can show a single merged card with the per-variant breakdown underneath,
+// instead of one card per spelling. Deliberately explicit/seeded, not
+// fuzzy-matched, so an unrelated future keyword never gets folded in.
+model KeywordGroup {
+  id        String    @id @default(cuid())
+  name      String    @unique
+  createdAt DateTime  @default(now())
+
+  keywords  Keyword[]
 }
 
 model Keyword {
@@ -43,9 +70,17 @@ model Keyword {
   term      String   @unique
   createdAt DateTime @default(now())
 
+  groupId   String?
+  group     KeywordGroup? @relation(fields: [groupId], references: [id])
+
+  deletedAt DateTime?
+  purgeAt   DateTime?
+
   scrapeRuns ScrapeRun[]
   posts      Post[]
   comments   Comment[]
+
+  @@index([groupId])
 }
 
 model ScrapeRun {
@@ -103,6 +138,16 @@ model Post {
   // table so totals are counted once, in one place.
   source        String   @default("scraper")
 
+  // Relevance check ("is this text actually ABOUT the brand/competitor, or
+  // generic same-topic chatter"), run in the same AI call as sentiment. null
+  // = not evaluated (legacy row), treated as relevant for backward
+  // compatibility. false = judged off-topic; excluded from alerts.
+  relevant        Boolean?
+  relevanceReason String?
+
+  deletedAt     DateTime?
+  purgeAt       DateTime?
+
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
@@ -114,6 +159,8 @@ model Post {
   @@index([publishedAt])
   @@index([isCompetitor])
   @@index([source])
+  @@index([relevant])
+  @@index([deletedAt])
 }
 
 model Comment {
@@ -153,6 +200,12 @@ model Comment {
   alertSent     Boolean  @default(false)
   isCompetitor  Boolean  @default(false)
 
+  relevant        Boolean?
+  relevanceReason String?
+
+  deletedAt     DateTime?
+  purgeAt       DateTime?
+
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
@@ -163,6 +216,8 @@ model Comment {
   @@index([status])
   @@index([publishedAt])
   @@index([isCompetitor])
+  @@index([relevant])
+  @@index([deletedAt])
 }
 
 // Persistent key-value settings stored directly in database for production deployment (Railway/Neon)
@@ -170,4 +225,22 @@ model SystemSetting {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
+}
+
+// Audit trail for every soft-delete/restore/purge. No auth/session system
+// exists in this app, so `actor` is a best-effort free-text field rather
+// than a real user id. `label` is a snapshot captured at delete time so the
+// log stays meaningful after the underlying row is purged.
+model DeletionLog {
+  id         String    @id @default(cuid())
+  entityType String    // "Keyword" | "PlatformKeyword" | "CompetitorCard" | "Post" | "Comment"
+  entityId   String
+  label      String
+  actor      String?
+  deletedAt  DateTime  @default(now())
+  restoredAt DateTime?
+  purgedAt   DateTime?
+
+  @@index([entityType, entityId])
+  @@index([purgedAt])
 }

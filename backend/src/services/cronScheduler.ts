@@ -81,7 +81,9 @@ export async function executeHourlyScrapeCycle() {
   try {
     // 1) Fetch all active platform keywords from DB
     const activeKeywords = await (prisma as any).platformKeyword.findMany({
-      where: { enabled: true },
+      // Deletion safety net: a trashed card must not keep scraping in the
+      // background during its 24h undo window.
+      where: { enabled: true, deletedAt: null },
     });
 
     // If no custom platform keywords exist yet, default to seed keywords for all 5 platforms
