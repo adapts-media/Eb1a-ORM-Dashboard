@@ -6,13 +6,14 @@ import { prisma } from "../lib/prisma";
 const envPath = path.resolve(__dirname, "../../.env");
 dotenv.config({ path: envPath });
 
-const DEFAULT_DATABASE_URL =
-  "postgresql://neondb_owner:npg_V5BenYtrj7LE@ep-shy-star-a5pnqlsg-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
-
 function getDatabaseUrl(): string {
   const raw = process.env.DATABASE_URL;
-  if (!raw || raw.trim().startsWith("file:")) {
-    return DEFAULT_DATABASE_URL;
+  if (!raw || !raw.trim() || raw.trim().startsWith("file:")) {
+    // No silent fallback: a missing DATABASE_URL must fail loudly rather than
+    // quietly connecting to whatever database happened to be hardcoded here.
+    throw new Error(
+      "DATABASE_URL is not set. Configure it in backend/.env (PostgreSQL connection string)."
+    );
   }
   return raw.trim();
 }
@@ -90,7 +91,7 @@ export async function refreshEnvFromDisk() {
     }
   } catch {}
 
-  // 2. Read persistent settings from Neon PostgreSQL database (takes priority in Production / Railway)
+  // 2. Read persistent settings from the database (takes priority over .env in production)
   try {
     const dbSettings = await prisma.systemSetting.findMany();
     for (const item of dbSettings) {
@@ -228,7 +229,7 @@ export async function updateSettings(updates: SettingsUpdatePayload) {
     process.env.DATABASE_URL = env.DATABASE_URL;
   }
 
-  // Save resolved settings directly into Neon PostgreSQL database for production persistence across Railway deployments
+  // Persist resolved settings in the database so they survive redeploys
   try {
     const finalMap: Record<string, string> = {
       APIFY_API_URL: env.APIFY_API_URL,
