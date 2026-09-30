@@ -74,11 +74,20 @@ jobs:
 
       - name: Deploy
         run: |
-          # Secrets pasted with a trailing newline would otherwise be spliced into
-          # the ssh target, which fails as 'remote username contains invalid characters'.
+          # Secrets pasted with a trailing newline would be spliced into the ssh
+          # target and fail as 'remote username contains invalid characters'.
           DEPLOY_USER=$(printf '%s' "${{ secrets.DEPLOY_USER }}" | tr -d '[:space:]')
           DEPLOY_HOST=$(printf '%s' "${{ secrets.DEPLOY_HOST }}" | tr -d '[:space:]')
-          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash /opt/orm-dashboard/redeploy.sh'
+          # Inbound SSH from runners is occasionally dropped upstream, so retry
+          # rather than failing a deploy that would succeed seconds later.
+          for attempt in 1 2 3; do
+            echo "deploy attempt $attempt"
+            if ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=45 -o ServerAliveInterval=15 "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash /opt/orm-dashboard/redeploy.sh'; then
+              echo 'deploy succeeded'; exit 0
+            fi
+            echo "attempt $attempt failed; retrying in 30s"; sleep 30
+          done
+          echo 'all deploy attempts failed'; exit 1
 
       - name: Health check
         run: |
