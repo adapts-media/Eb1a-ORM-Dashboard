@@ -211,9 +211,6 @@ export function OverviewPage() {
           <div className="stat-grid">
             <StatCard
               label={`Total Mentions (${selectedSource === "google" ? "GOOGLE SEARCH" : selectedPlatform.toUpperCase()})`}
-              trend={overview.trend?.change.total}
-              goodDirection="up"
-              windowDays={overview.trend?.windowDays}
               value={overview.totalMentions.toLocaleString()}
               sub={
                 selectedPlatform === "trustpilot"
