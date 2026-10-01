@@ -194,13 +194,16 @@ def launch_browser(p):
 # misread as "comments" on whichever post happened to load first.
 FEED_PATH_PREFIXES = ("/space/", "/topic/", "/profile/", "/q/")
 
-# Matches the relative/absolute date text Quora renders next to an answer
-# ("3 years ago", "Updated Tuesday", "Jan 5, 2024"). Deliberately the same
-# shapes parse_serp_date() already understands.
+# Matches the relative-time text Quora renders next to an answer ("3 years
+# ago", "5 hours ago") - this is Quora's actual per-answer timestamp style.
+# Deliberately NOT matching absolute dates ("January 1, 2026"): those are
+# indistinguishable from a date simply mentioned inside the question or
+# answer's own text (confirmed live - an answer to a question titled "...after
+# January 1, 2026?" got that date misattributed as its own publish date), so
+# absolute-looking text here is content, not a timestamp label, far more
+# often than not.
 DATE_TEXT_RE = re.compile(
-    r'\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago'
-    r'|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}'
-    r'|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}',
+    r'\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago',
     re.I
 )
 
@@ -234,9 +237,21 @@ EXTRACT_BLOCKS_JS = """() => {
 }"""
 
 
+# A Quora Space also gets its own subdomain (e.g. eb1aexpertsspace.quora.com),
+# whose root page lists the space's posts exactly like /space/<slug> does on
+# the main site. These are the hosts that are NOT a space's own subdomain.
+_STANDARD_QUORA_HOSTS = {"www.quora.com", "quora.com", "m.quora.com"}
+
+
 def is_feed_url(url: str) -> bool:
-    path = urllib.parse.urlparse(url).path.lower()
-    return any(path.startswith(prefix) for prefix in FEED_PATH_PREFIXES)
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if any(path.startswith(prefix) for prefix in FEED_PATH_PREFIXES):
+        return True
+    if host.endswith("quora.com") and host not in _STANDARD_QUORA_HOSTS and path in ("", "/"):
+        return True
+    return False
 
 
 def scroll_until_stable(page, max_rounds: int = 8, pause_ms: int = 1200) -> None:
@@ -268,10 +283,20 @@ def extract_feed_question_links(page, limit: int) -> list:
         path = urllib.parse.urlparse(link).path.lower()
         if any(p in path for p in ["/about", "/careers", "/contact", "/tos", "/privacy", "/login", "/signup"]):
             continue
+        # Space pages link each post twice: once as a clean canonical URL
+        # (/Question-Slug or /Question-Slug/answer/Author) and once as a
+        # mangled alias hosted on the space's own subdomain
+        # (spacename.quora.com/https-www-quora-com-...). Skip the alias and
+        # keep the canonical link so the same post isn't scraped twice under
+        # two different URLs.
+        if "https-www-quora-com" in path:
+            continue
         segs = [s for s in path.split("/") if s]
-        # A question slug is one long dashed segment, e.g. /What-is-EB1A -
-        # short segments here are nav links (/jobs, /help, etc), not questions.
-        if len(segs) != 1 or len(segs[0]) < 8:
+        # A real post is either /Question-Slug or /Question-Slug/answer/Author -
+        # short segments or any other shape are nav links, not questions.
+        if not segs or len(segs[0]) < 8:
+            continue
+        if len(segs) > 1 and not (len(segs) == 3 and segs[1] == "answer"):
             continue
         seen.add(link)
         links.append(link)
@@ -291,7 +316,18 @@ def scrape_single_quora_question(page, target_url: str):
     page_date = extract_page_date(page)
     extracted = page.evaluate(EXTRACT_BLOCKS_JS)
     title = extracted.get("title") or ""
-    blocks = [b for b in extracted.get("blocks", []) if is_valid_quora_text(b.get("text", ""))]
+
+    # Quora's responsive markup sometimes renders the same answer text twice
+    # (e.g. a desktop + mobile variant of the same block) - keep the first
+    # occurrence only so one real answer doesn't become two fake comments.
+    seen_text = set()
+    blocks = []
+    for b in extracted.get("blocks", []):
+        text = b.get("text", "")
+        if not is_valid_quora_text(text) or text in seen_text:
+            continue
+        seen_text.add(text)
+        blocks.append(b)
 
     if not title or not is_valid_quora_text(title) or not blocks:
         return None
