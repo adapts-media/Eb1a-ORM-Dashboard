@@ -189,7 +189,152 @@ def launch_browser(p):
         except Exception:
             return p.chromium.launch(headless=True)
 
-def scrape_direct_quora_url(target_url: str) -> list:
+# Space/topic/profile pages are feeds listing many unrelated questions — scraping
+# them like a single question page is what caused other posts' text to be
+# misread as "comments" on whichever post happened to load first.
+FEED_PATH_PREFIXES = ("/space/", "/topic/", "/profile/", "/q/")
+
+# Matches the relative/absolute date text Quora renders next to an answer
+# ("3 years ago", "Updated Tuesday", "Jan 5, 2024"). Deliberately the same
+# shapes parse_serp_date() already understands.
+DATE_TEXT_RE = re.compile(
+    r'\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago'
+    r'|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}'
+    r'|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}',
+    re.I
+)
+
+# Each answer block's own text, scraped alongside only its own nearby date text
+# (searched 1-2 DOM hops up, not the whole page) so one answer's date can't
+# bleed into another's. No class names are hardcoded here on purpose: Quora's
+# generated class names change often, and guessing wrong was the root cause of
+# the original bug. A block with no identifiable date text simply gets None —
+# never a fabricated date.
+EXTRACT_BLOCKS_JS = """() => {
+    const title = document.title ? document.title.replace('- Quora', '').replace('Quora', '').trim() : '';
+    const blocks = [];
+    const nodes = Array.from(document.querySelectorAll('.q-text, [class*="q-text"], p'));
+    for (const el of nodes) {
+        const text = (el.innerText || '').trim();
+        if (text.length < 25) continue;
+        let dateText = '';
+        let scope = el.parentElement;
+        for (let hop = 0; hop < 2 && scope; hop++) {
+            const scopeText = scope.innerText || '';
+            const rest = scopeText.split(text).join('').trim();
+            if (rest && rest.length > 0 && rest.length < 400) {
+                dateText = rest;
+                break;
+            }
+            scope = scope.parentElement;
+        }
+        blocks.push({ text, dateText });
+    }
+    return { title, blocks };
+}"""
+
+
+def is_feed_url(url: str) -> bool:
+    path = urllib.parse.urlparse(url).path.lower()
+    return any(path.startswith(prefix) for prefix in FEED_PATH_PREFIXES)
+
+
+def scroll_until_stable(page, max_rounds: int = 8, pause_ms: int = 1200) -> None:
+    """Keep scrolling while the page keeps growing, to trigger Quora's
+    lazy-loaded answer stream instead of reading whatever happened to render
+    after one short scroll."""
+    last_height = 0
+    for _ in range(max_rounds):
+        page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+        page.wait_for_timeout(pause_ms)
+        height = page.evaluate("document.body.scrollHeight")
+        if height <= last_height:
+            break
+        last_height = height
+
+
+def extract_feed_question_links(page, limit: int) -> list:
+    """Pull individual question links out of a Space/topic feed page, so each
+    gets scraped as its own post instead of the feed page being treated as one."""
+    hrefs = page.evaluate("Array.from(document.querySelectorAll('a[href]')).map(a => a.href)")
+    links = []
+    seen = set()
+    for href in hrefs or []:
+        link = href.split("?")[0].strip()
+        if not link or link in seen or "quora.com" not in link:
+            continue
+        if is_feed_url(link):
+            continue
+        path = urllib.parse.urlparse(link).path.lower()
+        if any(p in path for p in ["/about", "/careers", "/contact", "/tos", "/privacy", "/login", "/signup"]):
+            continue
+        segs = [s for s in path.split("/") if s]
+        # A question slug is one long dashed segment, e.g. /What-is-EB1A -
+        # short segments here are nav links (/jobs, /help, etc), not questions.
+        if len(segs) != 1 or len(segs[0]) < 8:
+            continue
+        seen.add(link)
+        links.append(link)
+        if len(links) >= limit:
+            break
+    return links
+
+
+def scrape_single_quora_question(page, target_url: str):
+    """Scrape one question page: the question as the post, its real answers as
+    comments, with a best-effort date per answer. Returns None if the page
+    didn't load real content (e.g. hit a login wall or 404)."""
+    page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+    page.wait_for_timeout(2000)
+    scroll_until_stable(page)
+
+    page_date = extract_page_date(page)
+    extracted = page.evaluate(EXTRACT_BLOCKS_JS)
+    title = extracted.get("title") or ""
+    blocks = [b for b in extracted.get("blocks", []) if is_valid_quora_text(b.get("text", ""))]
+
+    if not title or not is_valid_quora_text(title) or not blocks:
+        return None
+
+    p_id = make_stable_id("quora_post_url", target_url)
+    p_text = f"{title}\n\n{blocks[0]['text']}"
+
+    post_item = {
+        "type": "post",
+        "id": p_id,
+        "platform": "quora",
+        "text": p_text,
+        "title": title,
+        "url": target_url,
+        "author": "Quora Contributor",
+        "authorUrl": None,
+        "publishedAt": page_date,
+        "likes": 0,
+        "shares": 0,
+        "commentsCount": max(0, len(blocks) - 1),
+        "comments": []
+    }
+
+    for idx, block in enumerate(blocks[1:30]):
+        c_txt = block["text"]
+        date_match = DATE_TEXT_RE.search(block.get("dateText") or "")
+        c_date = parse_serp_date(date_match.group(0)) if date_match else None
+        c_id = make_stable_id("quora_comment_url", f"{p_id}::{c_txt}")
+        post_item["comments"].append({
+            "type": "comment",
+            "id": c_id,
+            "postId": p_id,
+            "text": c_txt,
+            "url": target_url,
+            "author": f"Quora Contributor {idx+1}",
+            "publishedAt": c_date,
+            "likes": 0
+        })
+
+    return post_item
+
+
+def scrape_direct_quora_url(target_url: str, feed_limit: int = 8) -> list:
     items = []
     if any(path in target_url.lower() for path in ["/about", "/careers", "/contact", "/tos", "/privacy", "/login"]):
         return []
@@ -203,61 +348,24 @@ def scrape_direct_quora_url(target_url: str) -> list:
             )
             page = context.new_page()
 
-            page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_timeout(2500)
-            page.evaluate("window.scrollBy(0, 1000)")
-            page.wait_for_timeout(1500)
+            if is_feed_url(target_url):
+                page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+                page.wait_for_timeout(2000)
+                scroll_until_stable(page, max_rounds=6, pause_ms=1000)
+                question_links = extract_feed_question_links(page, limit=feed_limit)
+                for link in question_links:
+                    try:
+                        item = scrape_single_quora_question(page, link)
+                    except Exception as err:
+                        sys.stderr.write(f"Quora feed item scrape warning for '{link}': {err}\n")
+                        continue
+                    if item:
+                        items.append(item)
+            else:
+                item = scrape_single_quora_question(page, target_url)
+                if item:
+                    items.append(item)
 
-            extracted = page.evaluate("""() => {
-                const title = document.title ? document.title.replace('- Quora', '').replace('Quora', '').trim() : '';
-                const paragraphs = Array.from(document.querySelectorAll('.q-text, [class*="q-text"], p'))
-                    .map(el => el.innerText ? el.innerText.trim() : '')
-                    .filter(txt => txt.length > 25);
-                return { title, paragraphs };
-            }""")
-
-            page_date = extract_page_date(page)
-            title = extracted.get("title") or ""
-            paragraphs = [p for p in extracted.get("paragraphs", []) if is_valid_quora_text(p)]
-
-            if not title or not is_valid_quora_text(title):
-                browser.close()
-                return []
-
-            p_id = make_stable_id("quora_post_url", target_url)
-            p_text = f"{title}\n\n{paragraphs[0]}" if paragraphs else title
-
-            post_item = {
-                "type": "post",
-                "id": p_id,
-                "platform": "quora",
-                "text": p_text,
-                "title": title,
-                "url": target_url,
-                "author": "Quora Contributor",
-                "authorUrl": None,
-                "publishedAt": page_date,
-                "likes": 0,
-                "shares": 0,
-                "commentsCount": max(0, len(paragraphs) - 1),
-                "comments": []
-            }
-
-            for idx, c_txt in enumerate(paragraphs[1:10]):
-                c_id = make_stable_id("quora_comment_url", f"{p_id}::{c_txt}")
-                post_item["comments"].append({
-                    "type": "comment",
-                    "id": c_id,
-                    "postId": p_id,
-                    "text": c_txt,
-                    "url": target_url,
-                    "author": f"Quora Contributor {idx+1}",
-                    # Per-answer dates aren't exposed by this extraction.
-                    "publishedAt": None,
-                    "likes": 0
-                })
-
-            items.append(post_item)
             browser.close()
     except Exception as err:
         sys.stderr.write(f"Direct Quora URL scrape error: {err}\n")
