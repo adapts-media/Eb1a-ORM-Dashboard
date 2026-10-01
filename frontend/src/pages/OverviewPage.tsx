@@ -239,7 +239,7 @@ export function OverviewPage() {
               sub={`${overview.negativePct}%`}
               variant="negative"
               trend={overview.trend?.change.negative}
-              goodDirection="down"
+              goodDirection="up"
               windowDays={overview.trend?.windowDays}
             />
             <StatCard
@@ -248,7 +248,7 @@ export function OverviewPage() {
               sub={`${overview.neutralPct}%`}
               variant="neutral"
               trend={overview.trend?.change.neutral}
-              goodDirection="up"
+              goodDirection="down"
               windowDays={overview.trend?.windowDays}
             />
           </div>
