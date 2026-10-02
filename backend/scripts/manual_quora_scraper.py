@@ -268,15 +268,30 @@ def scroll_until_stable(page, max_rounds: int = 8, pause_ms: int = 1200) -> None
         last_height = height
 
 
-def extract_feed_question_links(page, limit: int) -> list:
+def extract_feed_question_links(page, source_url: str, limit: int) -> list:
     """Pull individual question links out of a Space/topic feed page, so each
-    gets scraped as its own post instead of the feed page being treated as one."""
+    gets scraped as its own post instead of the feed page being treated as one.
+
+    A feed page also renders sidebar/footer content unrelated to the feed
+    itself - a language switcher (he.quora.com, id.quora.com, ...), links to
+    other people's unrelated Spaces, help articles, ad pixels. These are real
+    Quora URLs that pass every URL-shape check below, so shape alone can't
+    filter them out (confirmed live: a production run picked up a celebrity-
+    gossip Space and five language homepages as if they were EB1A posts).
+    The only reliable signal is the host: only follow links on the same host
+    as the page we're scraping, or on www.quora.com (the canonical form of a
+    post originally published to this space).
+    """
+    source_host = urllib.parse.urlparse(source_url).netloc.lower()
     hrefs = page.evaluate("Array.from(document.querySelectorAll('a[href]')).map(a => a.href)")
     links = []
     seen = set()
     for href in hrefs or []:
         link = href.split("?")[0].strip()
         if not link or link in seen or "quora.com" not in link:
+            continue
+        host = urllib.parse.urlparse(link).netloc.lower()
+        if host != source_host and host not in _STANDARD_QUORA_HOSTS:
             continue
         if is_feed_url(link):
             continue
@@ -388,7 +403,7 @@ def scrape_direct_quora_url(target_url: str, feed_limit: int = 8) -> list:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
                 page.wait_for_timeout(2000)
                 scroll_until_stable(page, max_rounds=6, pause_ms=1000)
-                question_links = extract_feed_question_links(page, limit=feed_limit)
+                question_links = extract_feed_question_links(page, target_url, limit=feed_limit)
                 for link in question_links:
                     try:
                         item = scrape_single_quora_question(page, link)
