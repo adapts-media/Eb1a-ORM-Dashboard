@@ -241,12 +241,16 @@ function parseRelevanceOutput(raw: string): { sentiment: SentimentLabel; confide
     throw new AiSentimentError("Could not parse relevance/sentiment from AI response.");
   }
 
+  const relevant = typeof parsed?.relevant === "boolean" ? parsed.relevant : true;
   const label = normalizeLabel(parsed?.sentiment);
   if (!label) {
+    // For text judged irrelevant the model often answers sentiment "N/A" — a valid
+    // "not about the subject" verdict, not a malformed reply. Stamp NEUTRAL so the
+    // item is marked irrelevant instead of failing and being retried every hour.
+    if (!relevant) return { relevant: false, sentiment: "NEUTRAL", confidence: null };
     throw new AiSentimentError(`AI response had an unrecognized sentiment value: ${JSON.stringify(parsed?.sentiment)}`);
   }
 
-  const relevant = typeof parsed?.relevant === "boolean" ? parsed.relevant : true;
   return { relevant, sentiment: label, confidence: normalizeConfidence(parsed?.confidence) };
 }
 
