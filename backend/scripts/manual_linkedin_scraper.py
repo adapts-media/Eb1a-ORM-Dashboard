@@ -94,6 +94,43 @@ def extract_keyword_from_url(url: str) -> str:
         pass
     return ""
 
+# Each query is paired with a Google recency window (tbs). Without one, every
+# run re-reads Google's all-time top 10 for the query, which is the same set of
+# already-stored posts hour after hour, so newly published posts never surface
+# (confirmed live: the all-time brand query returned mostly year-old posts, while
+# the past-month query returned 10 posts the database didn't have).
+#   qdr:d  past 24h  - catches each new post within its first day
+#   qdr:w  past week - covers a short outage and posts the day filter ranked out
+#   qdr:m  past month - for /pulse/ articles, which are published less often
+SEARCH_PLAN = [
+    ('site:linkedin.com/posts/ "{kw}"', "qdr:d"),
+    ('site:linkedin.com/posts/ "{kw}"', "qdr:w"),
+    ('site:linkedin.com/pulse/ "{kw}"', "qdr:m"),
+    ('site:linkedin.com "{kw}"', "qdr:w"),
+]
+
+_ACTIVITY_ID_RE = re.compile(r"activity-(\d{15,20})")
+
+
+def activity_id_to_date(url: str):
+    """Publish time encoded in a LinkedIn post URL's activity id (id >> 22 = epoch ms).
+
+    Serper omits its date field on time-filtered results, which would leave
+    every new post as "Unknown date". Checked against 210 stored posts: 172 match
+    the stored date within a day (the rest were the imprecise side).
+    """
+    m = _ACTIVITY_ID_RE.search(url or "")
+    if not m:
+        return None
+    try:
+        dt = datetime.fromtimestamp((int(m.group(1)) >> 22) / 1000, timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+    if dt.year < 2010 or dt > datetime.now(timezone.utc) + timedelta(days=1):
+        return None
+    return dt.isoformat()
+
+
 def fetch_serper_linkedin_posts(keyword: str, limit: int) -> list:
     serper_key = load_serper_key()
     if not serper_key:
@@ -101,27 +138,18 @@ def fetch_serper_linkedin_posts(keyword: str, limit: int) -> list:
         return []
 
     clean_kw = keyword.strip() or "eb1a"
-    
-    # Priority 1: Specifically target LinkedIn /posts/ content updates matching the search URL query
-    # Priority 2: Fall back to general /pulse/ or site:linkedin.com queries if needed
-    search_queries = [
-        f'site:linkedin.com/posts/ "{clean_kw}"',
-        f'site:linkedin.com/posts/ {clean_kw}',
-        f'inurl:linkedin.com/posts "{clean_kw}"',
-        f'site:linkedin.com/pulse/ "{clean_kw}"',
-        f'site:linkedin.com "{clean_kw}"',
-    ]
 
     items = []
     seen_urls = set()
 
-    for query in search_queries:
+    for query_template, recency in SEARCH_PLAN:
         if len(items) >= limit:
             break
 
+        query = query_template.format(kw=clean_kw)
         try:
             url = "https://google.serper.dev/search"
-            payload = json.dumps({"q": query}).encode("utf-8")
+            payload = json.dumps({"q": query, "tbs": recency}).encode("utf-8")
             headers = {
                 "X-API-KEY": serper_key,
                 "Content-Type": "application/json",
@@ -163,7 +191,7 @@ def fetch_serper_linkedin_posts(keyword: str, limit: int) -> list:
                         "url": link,
                         "author": author_name,
                         "authorUrl": link if "/in/" in link or "/company/" in link else None,
-                        "publishedAt": parse_serp_date(org.get("date"), snippet),
+                        "publishedAt": activity_id_to_date(link) or parse_serp_date(org.get("date"), snippet),
                         "likes": 0,
                         "shares": 0,
                         "commentsCount": 0,
